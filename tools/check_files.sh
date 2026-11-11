@@ -45,9 +45,10 @@ if [ -n "$bios" ]; then
   status=1
 fi
 
-# 4. No placeholder markers in code.
+# 4. No placeholder markers in code (this script itself documents the
+#    marker names in comments, so it is excluded from its own scan).
 markers=$(grep -rnE 'TODO|FIXME|XXX|HACK' \
-  crates/ tools/ tests/ Makefile 2>/dev/null)
+  crates/ tools/ tests/ Makefile --exclude='check_files.sh' 2>/dev/null)
 if [ -n "$markers" ]; then
   echo "FAIL: placeholder marker(s) in code:"
   echo "$markers"

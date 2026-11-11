@@ -41,10 +41,10 @@ done
 
 # 2. No paid / analytics / tracking references in code.
 if grep -rinE '(api\.stripe\.com|firebase|google-analytics|gtag\(|adsense|admob|crashlytics|sentry\.io|applovin|appodeal|unity-ads)' \
-    crates/ tools/ >/dev/null 2>&1; then
+    crates/ tools/ --exclude='cost_check.sh' >/dev/null 2>&1; then
   echo "FAIL: paid/analytics/tracking reference found:"
   grep -rinE '(api\.stripe\.com|firebase|google-analytics|gtag\(|adsense|admob|crashlytics|sentry\.io|applovin|appodeal|unity-ads)' \
-    crates/ tools/ || true
+    crates/ tools/ --exclude='cost_check.sh' || true
   status=1
 fi
 
