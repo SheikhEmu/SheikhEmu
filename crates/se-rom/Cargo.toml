@@ -3,7 +3,10 @@ name = "se-rom"
 description = "SheikhEmu cartridge loader: iNES and NES 2.0 parsing"
 version.workspace = true
 edition.workspace = true
+license.workspace = true
 publish.workspace = true
 
+# Internal path deps are pinned: version-less path deps are wildcards (*)
+# and trip the cargo-deny `wildcards = "deny"` ban.
 [dependencies]
-se-core = { path = "../se-core" }
+se-core = { path = "../se-core", version = "0.1.0" }

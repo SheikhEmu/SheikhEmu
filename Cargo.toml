@@ -5,6 +5,9 @@ members = ["crates/se-core", "crates/se-rom", "crates/se-cli"]
 [workspace.package]
 version = "0.1.0"
 edition = "2021"
+# B-05 closed 2026-11-11: MIT, chosen explicitly by the owner
+# (see LICENSE and DECISIONS.md D-14).
+license = "MIT"
 publish = false
 
 # NOTE: no external dependencies by design (zero-cost / zero-network rule).

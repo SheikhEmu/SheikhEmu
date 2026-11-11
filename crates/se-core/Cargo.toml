@@ -3,6 +3,7 @@ name = "se-core"
 description = "SheikhEmu emulation core: 6502 CPU and region timing constants"
 version.workspace = true
 edition.workspace = true
+license.workspace = true
 publish.workspace = true
 
 [dependencies]
