@@ -1,133 +1,173 @@
-//! M1 execution shell: CPU + bus + a deterministic cycle counter.
+//! M2 execution shell: CPU + bus + the real PPU.
 //!
 //! This is the concrete realization of the scheduler decision (spec
-//! §5.0.1, DECISIONS.md D-16): a single monotonic master counter, the CPU
-//! cycle as the base unit, no threads and no wall-clock dependency. In
-//! M1 the machine simply counts CPU cycles and derives the PPU dot
-//! position arithmetically (nothing renders yet); the event queue joins
-//! when the PPU arrives in M2.
+//! §5.0.1, DECISIONS.md D-16): a single monotonic master counter, the
+//! CPU cycle as the base unit, no threads and no wall-clock
+//! dependency. The bus owns the counter and ticks the PPU by the
+//! region's dots-per-cycle ratio at every CPU access (§5.0.1 order:
+//! CPU read/write first, then the PPU dots of that cycle); the
+//! machine true-ups the internal instruction cycles at instruction
+//! end, so the PPU is exactly synchronized at every instruction
+//! boundary.
 //!
-//! Frame budget: NTSC frames average 29780.5 CPU cycles because of the
-//! odd-frame dot skip, which only matters while rendering is enabled.
-//! M1 uses a fixed 29780-cycle budget (see `docs/TIMING.md`); the exact
-//! per-frame length becomes real with the PPU in M2. Determinism — the
-//! actual M1 requirement — is exact.
+//! Frames are now real: `run_frames` counts PPU frame completions
+//! (the pre-render-to-line-0 wrap), not a fixed cycle budget. The
+//! instruction that crosses the boundary may overshoot by up to six
+//! cycles into the new frame — a deterministic, documented definition.
+//! NTSC odd frames are one dot shorter while rendering is enabled,
+//! so rendered frames average 29,780.5 CPU cycles exactly as the
+//! documented timing table promises.
 
 use crate::bus::{BusError, NesBus};
 use crate::cpu::{Cpu, CpuError};
-use crate::timing::{Region, DOTS_PER_SCANLINE};
+use crate::ppu::{Chr, Mirroring, Ppu};
+use crate::timing::Region;
 
 /// FNV-1a 64-bit offset basis (public domain algorithm).
 const FNV_OFFSET_BASIS: u64 = 0xcbf2_9ce4_8422_2325;
 /// FNV-1a 64-bit prime.
 const FNV_PRIME: u64 = 0x0000_0100_0000_01b3;
 
-/// M1 CPU-cycle budget of one frame (see the module docs).
-pub fn frame_cycles(region: Region) -> u64 {
-    match region {
-        // Truncated from the 29780.5 average; the half cycle and the odd
-        // frame skip only exist while rendering (M2+).
-        Region::Ntsc => 29_780,
-        Region::Pal => 33_247,
-        Region::Dendy => 35_464,
-    }
-}
+/// The NMI vector.
+const NMI_VECTOR: u16 = 0xFFFA;
 
-/// The M1 machine: CPU + NROM bus + cycle counter.
+/// The M2 machine: CPU + NROM bus with the real PPU.
 #[derive(Clone, Debug)]
 pub struct Machine {
     /// The CPU.
     pub cpu: Cpu,
-    /// The CPU-visible bus.
+    /// The CPU-visible bus (owns the PPU and the master clock).
     pub bus: NesBus,
     /// Console region (timing constants).
     pub region: Region,
-    /// CPU cycles elapsed since power-on (the master counter).
-    pub cycle: u64,
     /// Instructions executed since power-on.
     pub instructions: u64,
 }
 
 impl Machine {
-    /// Build a machine with a PRG image (NROM) for a region.
+    /// Build a machine with a PRG image (NROM, CHR-RAM, vertical
+    /// mirroring) for a region.
     pub fn new(prg: Vec<u8>, region: Region) -> Result<Self, BusError> {
+        let bus = NesBus::new(prg, region)?;
         Ok(Machine {
             cpu: Cpu::new(),
-            bus: NesBus::new(prg)?,
+            bus,
             region,
-            cycle: 0,
             instructions: 0,
         })
     }
 
+    /// Build a machine from cartridge data.
+    pub fn from_cartridge(
+        prg: Vec<u8>,
+        chr: Chr,
+        mirroring: Mirroring,
+        prg_ram: bool,
+        region: Region,
+    ) -> Result<Self, BusError> {
+        let bus = NesBus::with_cartridge(prg, chr, mirroring, prg_ram, region)?;
+        Ok(Machine {
+            cpu: Cpu::new(),
+            bus,
+            region,
+            instructions: 0,
+        })
+    }
+
+    /// The master CPU cycle count (the bus's counter).
+    pub fn cycle(&self) -> u64 {
+        self.bus.cycle()
+    }
+
     /// Power-on reset: seven cycles, PC from `$FFFC`, `S -= 3`.
     pub fn reset(&mut self) {
+        let before = self.bus.cycle();
         let cycles = u64::from(self.cpu.reset(&mut self.bus));
-        self.cycle += cycles;
+        let advanced = self.bus.cycle() - before;
+        self.bus.advance_cycles(cycles - advanced);
     }
 
     /// Test-ROM automation entry: power state with the PC forced
-    /// (nestest style) and the counter at the post-reset position.
+    /// (nestest style) and the counters at the post-reset position.
     ///
     /// The stack pointer and registers keep their power-up values
     /// because no reset sequence runs — this reproduces the documented
-    /// automation convention of the reference CPU test.
+    /// automation convention of the reference CPU test. The PPU jumps
+    /// to dot 21 of line 0: the 21 dots the seven reset cycles would
+    /// have ticked, matching the reference trace convention.
     pub fn start_automation(&mut self, pc: u16) {
         self.cpu = Cpu::new().with_pc(pc);
-        self.cycle = 7;
+        self.bus.set_cycles(7);
+        self.bus.ppu_mut().start_automation();
         self.instructions = 0;
     }
 
-    /// Execute one instruction; returns the cycles it used.
+    /// Execute one instruction (or service one pending NMI first);
+    /// returns the CPU cycles the instruction itself consumed.
+    ///
+    /// NMI is edge-latched inside the PPU and consumed here at the
+    /// instruction boundary (the documented B1 sampling point; the
+    /// delayed-IRQ and interrupt-hijack refinements are deferred to
+    /// the scheduler milestone with real interrupt sources).
     pub fn step(&mut self) -> Result<u8, CpuError> {
-        let cycles = self.cpu.step(&mut self.bus)?;
-        self.cycle += u64::from(cycles);
+        let nmi = self.bus.ppu_mut().take_nmi();
+        let before = self.bus.cycle();
+        let cycles = if nmi {
+            self.cpu.service_interrupt(&mut self.bus, NMI_VECTOR)
+        } else {
+            self.cpu.step(&mut self.bus)?
+        };
+        let advanced = self.bus.cycle() - before;
+        // True-up: every CPU cycle of the instruction ticks its PPU
+        // dots, including the internal (non-access) ones. A DMA
+        // already advanced more than the instruction's own cycles.
+        let cycles = u64::from(cycles);
+        if advanced < cycles {
+            self.bus.advance_cycles(cycles - advanced);
+        }
         self.instructions += 1;
-        Ok(cycles)
+        Ok(cycles as u8)
     }
 
-    /// Run whole instructions until at least `budget` cycles are spent.
-    ///
-    /// Instructions are atomic, so the counter may overshoot by up to
-    /// six cycles; the definition is fixed and deterministic.
+    /// Run whole instructions until at least `budget` cycles are
+    /// spent on the master clock.
     pub fn run_cycles(&mut self, budget: u64) -> Result<u64, CpuError> {
-        while self.cycle < budget {
+        while self.bus.cycle() < budget {
             self.step()?;
         }
-        Ok(self.cycle)
+        Ok(self.bus.cycle())
     }
 
-    /// Run `frames` frames at the M1 per-region cycle budget.
-    pub fn run_frames(&mut self, frames: u32) -> Result<u64, CpuError> {
-        let target = self.cycle + u64::from(frames) * frame_cycles(self.region);
-        self.run_cycles(target)
-    }
-
-    /// PPU position as `(scanline, dot)`, derived from the cycle count.
+    /// Run until `frames` PPU frame completions happened.
     ///
-    /// With no PPU hardware in M1, the position is the arithmetic
-    /// counter the real PPU would show with rendering disabled; it
-    /// matches the reference trace convention (dot = dots_per_cycle *
-    /// cycles, wrapping the 341-dot scanline and the per-region frame).
-    pub fn ppu_position(&self) -> (u32, u32) {
-        // Total PPU dots: CPU cycles * (cpu_divisor / ppu_divisor).
-        // NTSC/Dendy are exactly 3 dots per cycle; PAL is 16/5 — scale
-        // by cpu_div and divide by ppu_div to stay in integers.
-        let dots = self.cycle * u64::from(self.region.cpu_divisor())
-            / u64::from(self.region.ppu_divisor());
-        let scanlines_per_frame = u64::from(self.region.scanlines_per_frame());
-        let dots_per_frame = u64::from(DOTS_PER_SCANLINE) * scanlines_per_frame;
-        let frame_dot = dots % dots_per_frame;
-        let scanline = (frame_dot / u64::from(DOTS_PER_SCANLINE)) as u32;
-        let dot = (frame_dot % u64::from(DOTS_PER_SCANLINE)) as u32;
-        (scanline, dot)
+    /// Deterministic overshoot: the instruction that crosses a frame
+    /// boundary finishes first (up to six cycles into the new frame,
+    /// plus DMA cycles when one straddles the boundary).
+    pub fn run_frames(&mut self, frames: u32) -> Result<u64, CpuError> {
+        let target = self.bus.ppu().frame() + u64::from(frames);
+        while self.bus.ppu().frame() < target {
+            self.step()?;
+        }
+        Ok(self.bus.cycle())
+    }
+
+    /// PPU position as `(scanline, dot)` — the real device.
+    pub fn ppu_position(&self) -> (u16, u16) {
+        self.bus.ppu().position()
+    }
+
+    /// The PPU (frames, planes, protocol reads).
+    pub fn ppu(&self) -> &Ppu {
+        self.bus.ppu()
     }
 
     /// Deterministic state signature (FNV-1a 64) of the machine.
     ///
-    /// Hashes everything that two identical runs could distinguish:
-    /// region, cycle and instruction counters, CPU registers, RAM and
-    /// the open-bus latch. Pure integer arithmetic, so the same inputs
+    /// Hashes everything two identical runs could distinguish:
+    /// region, the master cycle and instruction counters, CPU
+    /// registers, RAM, the open-bus latch and the complete PPU state
+    /// (registers, loopy scroll, VRAM, palette, OAM, CHR RAM, timing,
+    /// interrupt latch). Pure integer arithmetic, so the same inputs
     /// give the same hash on every architecture (D-16 requirement).
     pub fn state_hash(&self) -> u64 {
         let mut hash = FNV_OFFSET_BASIS;
@@ -137,22 +177,62 @@ impl Machine {
             Region::Dendy => 2,
         };
         hash = mix_u8(hash, region_byte);
-        hash = mix_u64(hash, self.cycle);
+        hash = mix_u64(hash, self.bus.cycle());
         hash = mix_u64(hash, self.instructions);
         hash = mix_u8(hash, self.cpu.a);
         hash = mix_u8(hash, self.cpu.x);
         hash = mix_u8(hash, self.cpu.y);
         hash = mix_u8(hash, self.cpu.sp);
-        // The B flag is a phantom bit; hash the stored P as-is (it never
-        // contains B in this implementation).
+        // The B flag is a phantom bit; hash the stored P as-is (it
+        // never contains B in this implementation).
         hash = mix_u8(hash, self.cpu.p);
         hash = mix_u8(hash, u8::from(self.cpu.halted));
         hash = mix_u16(hash, self.cpu.pc);
         for byte in self.bus.ram() {
             hash = mix_u8(hash, *byte);
         }
-        mix_u8(hash, self.bus.latch())
+        hash = mix_u8(hash, self.bus.latch());
+        if let Some(ram) = self.bus.prg_ram() {
+            for byte in ram {
+                hash = mix_u8(hash, *byte);
+            }
+        }
+        let ppu = self.bus.ppu();
+        hash = mix_u8(hash, ppu.ctrl);
+        hash = mix_u8(hash, ppu.mask);
+        hash = mix_u8(hash, ppu.status_bits());
+        hash = mix_u16(hash, ppu.scroll_v());
+        hash = mix_u16(hash, ppu.scroll_t());
+        hash = mix_u8(hash, ppu.fine_x());
+        hash = mix_u8(hash, u8::from(ppu.write_toggle()));
+        hash = mix_u8(hash, ppu.oam_addr());
+        hash = mix_u8(hash, ppu.read_buffer());
+        hash = mix_u16(hash, ppu.position().0);
+        hash = mix_u16(hash, ppu.position().1);
+        hash = mix_u64(hash, ppu.frame());
+        hash = mix_u8(hash, u8::from(ppu.odd_frame()));
+        hash = mix_u8(hash, u8::from(ppu.nmi_pending()));
+        for byte in ppu.vram() {
+            hash = mix_u8(hash, *byte);
+        }
+        for byte in ppu.palette_ram() {
+            hash = mix_u8(hash, *byte);
+        }
+        for byte in ppu.oam() {
+            hash = mix_u8(hash, *byte);
+        }
+        if let Some(chr) = ppu_chr_ram(ppu) {
+            for byte in chr {
+                hash = mix_u8(hash, *byte);
+            }
+        }
+        hash
     }
+}
+
+/// CHR RAM exposure for the hash (the ROM kind is static).
+fn ppu_chr_ram(ppu: &Ppu) -> Option<&[u8; 0x2000]> {
+    ppu.chr_ram_bytes()
 }
 
 /// FNV-1a mixing helpers (wrapping arithmetic, portable).
@@ -194,9 +274,11 @@ mod tests {
     fn reset_reads_the_vector_and_counts_seven_cycles() {
         let mut machine = Machine::new(nop_prg(), Region::Ntsc).expect("prg");
         machine.reset();
-        assert_eq!(machine.cycle, 7);
+        assert_eq!(machine.cycle(), 7);
         assert_eq!(machine.cpu.pc, 0x8000);
         assert_eq!(machine.cpu.sp, 0xFA);
+        // The PPU sits exactly at the post-reset position (0, 21).
+        assert_eq!(machine.ppu_position(), (0, 21));
     }
 
     #[test]
@@ -205,7 +287,8 @@ mod tests {
         machine.start_automation(0xC000);
         assert_eq!(machine.cpu.pc, 0xC000);
         assert_eq!(machine.cpu.sp, 0xFD);
-        assert_eq!(machine.cycle, 7);
+        assert_eq!(machine.cycle(), 7);
+        assert_eq!(machine.ppu_position(), (0, 21));
     }
 
     #[test]
@@ -214,29 +297,11 @@ mod tests {
         machine.reset();
         // 10 NOPs = 20 cycles from cycle 7.
         machine.run_cycles(27).expect("nop slide");
-        assert_eq!(machine.cycle, 27);
+        assert_eq!(machine.cycle(), 27);
         assert_eq!(machine.instructions, 10);
-        // The next instruction would cross the budget: nothing more runs.
         machine.run_cycles(28).expect("nop slide");
-        assert_eq!(machine.cycle, 29);
+        assert_eq!(machine.cycle(), 29);
         assert_eq!(machine.instructions, 11);
-    }
-
-    #[test]
-    fn frame_budgets_follow_the_region() {
-        assert_eq!(frame_cycles(Region::Ntsc), 29_780);
-        assert_eq!(frame_cycles(Region::Pal), 33_247);
-        assert_eq!(frame_cycles(Region::Dendy), 35_464);
-    }
-
-    #[test]
-    fn run_frames_is_cycle_budget_times_frames() {
-        let mut machine = Machine::new(nop_prg(), Region::Ntsc).expect("prg");
-        machine.reset();
-        machine.run_frames(3).expect("nop slide");
-        // Whole instructions only: 7 + 29780*3 with <=6 cycles overshoot.
-        assert!(machine.cycle >= 7 + 29_780 * 3);
-        assert!(machine.cycle < 7 + 29_780 * 3 + 7);
     }
 
     #[test]
@@ -246,10 +311,51 @@ mod tests {
         // The nestest convention: at CPU cycle 7 the PPU sits at (0, 21).
         assert_eq!(machine.ppu_position(), (0, 21));
         machine.run_cycles(100).expect("nop slide");
-        let dots = machine.cycle * 3;
-        let scanline = (dots / 341 % 262) as u32;
-        let dot = (dots % 341) as u32;
+        let dots = machine.cycle() * 3;
+        let scanline = (dots / 341 % 262) as u16;
+        let dot = (dots % 341) as u16;
         assert_eq!(machine.ppu_position(), (scanline, dot));
+    }
+
+    /// A cartridge whose reset entry loops on itself (`JMP $C000`),
+    /// so long runs never wander off the PRG.
+    fn loop_prg() -> Vec<u8> {
+        let mut prg = vec![0xEA; 16 * 1024];
+        prg[0..3].copy_from_slice(&[0x4C, 0x00, 0xC0]);
+        prg[0x3FFA..0x4000].copy_from_slice(&[0x00, 0xC0, 0x00, 0xC0, 0x00, 0xC0]);
+        prg
+    }
+
+    #[test]
+    fn real_frames_count_without_a_fixed_budget() {
+        let mut machine = Machine::new(loop_prg(), Region::Ntsc).expect("prg");
+        machine.reset();
+        machine.run_frames(3).expect("loop");
+        // Rendering is off: every frame is the full 341x262 dots. The
+        // third completion ticks dot 3*89,342 = 268,026, which lands
+        // during cycle 89,342; the 3-cycle JMP instruction that
+        // contains it ends at 89,344 (deterministic overshoot).
+        assert_eq!(machine.cycle(), 89_344);
+        assert_eq!(machine.ppu().frame(), 3);
+    }
+
+    #[test]
+    fn nmi_fires_at_vblank_and_returns_exactly() {
+        // A self-looping cartridge with an NMI handler that increments
+        // $00F0 (placed off the execution path).
+        let mut prg = vec![0xEA; 16 * 1024];
+        prg[0..3].copy_from_slice(&[0x4C, 0x00, 0xC0]); // JMP $C000
+        prg[0x20..0x23].copy_from_slice(&[0xE6, 0xF0, 0x40]); // $C020
+        prg[0x3FFA..0x4000].copy_from_slice(&[0x20, 0xC0, 0x00, 0xC0, 0x00, 0xC0]);
+        let mut machine = Machine::new(prg, Region::Ntsc).expect("prg");
+        machine.reset();
+        // Run to mid-frame, enable NMI, then let vblank arrive.
+        machine.run_cycles(1000).expect("loop");
+        machine.bus.write(0x2000, 0x80);
+        machine.run_frames(1).expect("loop");
+        assert_eq!(machine.bus.peek(0x00F0), 1, "the NMI handler ran");
+        machine.run_frames(1).expect("loop");
+        assert_eq!(machine.bus.peek(0x00F0), 2, "exactly one NMI per frame");
     }
 
     #[test]
@@ -271,6 +377,22 @@ mod tests {
         b.reset();
         a.bus.write(0x0050, 0x11);
         b.bus.write(0x0050, 0x22);
+        assert_ne!(a.state_hash(), b.state_hash());
+    }
+
+    #[test]
+    fn different_ppu_vram_gives_a_different_hash() {
+        let mut a = Machine::new(nop_prg(), Region::Ntsc).expect("prg");
+        let mut b = Machine::new(nop_prg(), Region::Ntsc).expect("prg");
+        a.reset();
+        b.reset();
+        // Write to $2000 VRAM through the register pair.
+        a.bus.write(0x2006, 0x20);
+        a.bus.write(0x2006, 0x00);
+        a.bus.write(0x2007, 0x11);
+        b.bus.write(0x2006, 0x20);
+        b.bus.write(0x2006, 0x00);
+        b.bus.write(0x2007, 0x22);
         assert_ne!(a.state_hash(), b.state_hash());
     }
 

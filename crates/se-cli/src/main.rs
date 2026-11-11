@@ -12,7 +12,10 @@ use std::fs;
 use std::io::{BufWriter, Write};
 use std::process::ExitCode;
 
+mod png;
+
 use se_core::machine::Machine;
+use se_core::ppu::{Chr, Mirroring as CoreMirroring};
 use se_core::timing::Region;
 use se_core::trace::format_trace_line;
 use se_rom::ines::{parse, InesRom, Mirroring, TimingRegion};
@@ -36,6 +39,8 @@ enum CommandError {
     Halted { cycles: u64, instructions: u64 },
     /// The trace log file could not be written.
     TraceUnwritable,
+    /// The frame dump PNG could not be written.
+    FrameUnwritable,
 }
 
 impl std::fmt::Display for CommandError {
@@ -60,6 +65,9 @@ impl std::fmt::Display for CommandError {
             ),
             CommandError::TraceUnwritable => {
                 write!(f, "تعذر كتابة ملف سجل التتبّع — تحقق من المسار والصلاحيات")
+            }
+            CommandError::FrameUnwritable => {
+                write!(f, "تعذر كتابة ملف صورة الإطار — تحقق من المسار والصلاحيات")
             }
         }
     }
@@ -138,7 +146,7 @@ fn print_usage() {
     println!("الاستعمال:");
     println!("  se-cli info <ملف.nes>   تقرير تفصيلي عن الكارتريدج");
     println!("  se-cli run <ملف.nes> --frames N [--hash] [--trace-cpu <ملف>]");
-    println!("        [--instructions N] [--start-pc <عنوان-ست-عشري>]");
+    println!("        [--instructions N] [--start-pc <عنوان-ست-عشري>] [--dump-frame <ملف.png>]");
     println!("  se-cli -h | --help      هذه المساعدة");
 }
 
@@ -165,6 +173,7 @@ struct RunOptions {
     hash: bool,
     trace: Option<String>,
     start_pc: Option<u16>,
+    dump_frame: Option<String>,
 }
 
 impl RunOptions {
@@ -176,6 +185,7 @@ impl RunOptions {
             hash: false,
             trace: None,
             start_pc: None,
+            dump_frame: None,
         };
         let mut i = 0;
         while i < flags.len() {
@@ -221,6 +231,13 @@ impl RunOptions {
                     })?);
                     i += 2;
                 }
+                "--dump-frame" => {
+                    let value = flags.get(i + 1).ok_or_else(|| {
+                        CommandError::BadArgument("--dump-frame يحتاج مسار ملف".to_string())
+                    })?;
+                    options.dump_frame = Some(value.clone());
+                    i += 2;
+                }
                 other => {
                     return Err(CommandError::BadArgument(other.to_string()));
                 }
@@ -254,7 +271,22 @@ fn run_command(path: &str, flags: &[String]) -> Result<String, CommandError> {
         return Err(CommandError::UnsupportedMapper(rom.mapper));
     }
     let region = region_of(&rom);
-    let mut machine = Machine::new(rom.prg, region)?;
+    // Cartridge data for the M2 bus: CHR (ROM banks, or 8 KiB RAM when
+    // the board ships none — the documented mapper-0 convention), the
+    // nametable mirroring, and PRG RAM (the battery bit or an explicit
+    // NES 2.0 size).
+    let chr = if rom.chr.is_empty() {
+        Chr::Ram(Box::new([0; 0x2000]))
+    } else {
+        Chr::Rom(rom.chr.clone())
+    };
+    let mirroring = match rom.mirroring {
+        Mirroring::Vertical => CoreMirroring::Vertical,
+        Mirroring::Horizontal => CoreMirroring::Horizontal,
+        Mirroring::FourScreen => CoreMirroring::FourScreen,
+    };
+    let prg_ram = rom.battery || rom.prg_ram.is_some_and(|bytes| bytes > 0);
+    let mut machine = Machine::from_cartridge(rom.prg, chr, mirroring, prg_ram, region)?;
 
     // Test-ROM automation entry (nestest convention) or a real reset.
     match options.start_pc {
@@ -285,19 +317,20 @@ fn run_command(path: &str, flags: &[String]) -> Result<String, CommandError> {
             for _ in 0..count {
                 trace_one(&machine, &mut trace_writer);
                 if let Err(se_core::CpuError::Halted) = machine.step() {
-                    halted = Some((machine.cycle, machine.instructions));
+                    halted = Some((machine.cycle(), machine.instructions));
                     break;
                 }
             }
         }
         RunLength::Frames(frames) => {
-            // Frame-by-frame so a trace stays readable frame by frame.
+            // Real PPU frames: each iteration runs to the next frame
+            // completion so a trace stays readable frame by frame.
             for _ in 0..frames {
-                let target = machine.cycle + se_core::machine::frame_cycles(region);
-                while machine.cycle < target {
+                let target = machine.ppu().frame() + 1;
+                while machine.ppu().frame() < target {
                     trace_one(&machine, &mut trace_writer);
                     if let Err(se_core::CpuError::Halted) = machine.step() {
-                        halted = Some((machine.cycle, machine.instructions));
+                        halted = Some((machine.cycle(), machine.instructions));
                         break;
                     }
                 }
@@ -333,13 +366,26 @@ fn run_command(path: &str, flags: &[String]) -> Result<String, CommandError> {
     report.push_str(&format!("تقرير التشغيل: {file_name}\n"));
     report.push_str(&format!("المنطقة: {region_text}\n"));
     report.push_str(&format!("مدة التشغيل: {length_text}\n"));
-    report.push_str(&format!("الدورات المنفّذة: {}\n", machine.cycle));
+    report.push_str(&format!("الإطارات المكتملة: {}\n", machine.ppu().frame()));
+    report.push_str(&format!("الدورات المنفّذة: {}\n", machine.cycle()));
     report.push_str(&format!("التعليمات المنفّذة: {}\n", machine.instructions));
     if let Some(file) = options.trace.as_deref() {
         report.push_str(&format!("سجل التتبّع: {file}\n"));
     }
     if options.hash {
         report.push_str(&format!("بصمة الحالة: {:016x}\n", machine.state_hash()));
+        report.push_str(&format!(
+            "بصمة الإطار: {:016x}\n",
+            machine.ppu().last_plane_hash()
+        ));
+    }
+    if let Some(file) = options.dump_frame.as_deref() {
+        // Heap-allocated: the fixed RGB plane stays out of the stack.
+        let mut rgb = Box::new([0u8; 256 * 240 * 3]);
+        machine.ppu().last_frame_rgb(&mut rgb);
+        png::write_png(std::path::Path::new(file), rgb.as_slice(), 256, 240)
+            .map_err(|_| CommandError::FrameUnwritable)?;
+        report.push_str(&format!("صورة الإطار: {file}\n"));
     }
     Ok(report)
 }

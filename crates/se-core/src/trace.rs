@@ -52,7 +52,7 @@ pub fn format_trace_line(machine: &Machine) -> String {
         machine.cpu.sp,
         scanline,
         dot,
-        machine.cycle
+        machine.cycle()
     )
 }
 
@@ -273,7 +273,8 @@ mod tests {
         // After LDX #$00 the CPU sits at C5F7 with X=0 and P=$26.
         machine.cpu.p = 0x26;
         machine.cpu.pc = 0xC5F7;
-        machine.cycle = 12;
+        // Advance to master cycle 12 (the automation base is 7).
+        machine.bus.advance_cycles(5);
         let line = format_trace_line(&machine);
         assert_eq!(
             line,
@@ -366,7 +367,7 @@ mod tests {
     fn ppu_position_column_formats_three_wide() {
         // A line deep into a frame must keep 3-wide PPU numbers.
         let mut machine = machine_with(0xC000, &[0xEA]);
-        machine.cycle = 26_548;
+        machine.bus.advance_cycles(26_548 - 7);
         let line = format_trace_line(&machine);
         assert!(line.contains("PPU:233,191 CYC:26548"), "got: {line}");
     }

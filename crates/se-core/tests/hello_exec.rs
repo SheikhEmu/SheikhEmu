@@ -108,11 +108,13 @@ fn hello_counters_match_the_independent_model_at_every_boundary() {
         // run_cycles stops at the first whole-instruction end at or past
         // the budget: the model must be evaluated at that exact cycle.
         let visible = (machine.bus.peek(0x0200), machine.bus.peek(0x0201));
-        let expected = model_visible_at(machine.cycle);
+        let expected = model_visible_at(machine.cycle());
         assert_eq!(
-            visible, expected,
+            visible,
+            expected,
             "tick/lap counters at cycle {} (budget {})",
-            machine.cycle, budget
+            machine.cycle(),
+            budget
         );
     }
 }
@@ -136,13 +138,17 @@ fn hello_interrupts_round_trip_through_the_real_vectors() {
     machine.reset();
     machine.run_cycles(2900).expect("hello runs forever");
     let interrupted_pc = machine.cpu.pc;
+    let before = machine.cycle();
     let cycles = u64::from(machine.cpu.service_interrupt(&mut machine.bus, 0xFFFA));
     assert_eq!(cycles, 7);
     assert_eq!(machine.cpu.pc, 0xC024);
-    machine.cycle += cycles;
+    // True-up the interrupt's internal cycles on the master clock.
+    machine
+        .bus
+        .advance_cycles(cycles - (machine.cycle() - before));
     // RTI of the handler: six documented cycles.
     assert_eq!(machine.step(), Ok(6));
-    machine.cycle += 6;
+    assert_eq!(machine.cycle(), before + 7 + 6);
     assert_eq!(machine.cpu.pc, interrupted_pc);
 }
 
