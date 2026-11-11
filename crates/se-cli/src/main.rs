@@ -1,15 +1,20 @@
 //! `se-cli` — the Arabic-native command line interface of SheikhEmu.
 //!
-//! M0 provides one real command: `info <file>`, which parses an iNES /
-//! NES 2.0 cartridge image and prints a full Arabic report, including
-//! header warnings. Deliberately unimplemented commands (such as
-//! actually running a ROM with frame hashing) are *not* advertised; they
-//! arrive with the emulation milestones instead of being stubbed.
+//! M1 provides two real commands: `info <file>` (cartridge report) and
+//! `run <file>` — headless execution of an NROM cartridge with frame
+//! hashing and an optional CPU trace log in the reference format
+//! (the M1.5 nestest calibration protocol). Commands that do not
+//! exist yet (PPU rendering, APU output, mapper families) are not
+//! advertised or stubbed; they arrive with their milestones.
 
 use std::env;
 use std::fs;
+use std::io::{BufWriter, Write};
 use std::process::ExitCode;
 
+use se_core::machine::Machine;
+use se_core::timing::Region;
+use se_core::trace::format_trace_line;
 use se_rom::ines::{parse, InesRom, Mirroring, TimingRegion};
 use se_rom::RomError;
 
@@ -21,6 +26,16 @@ enum CommandError {
     FileUnreadable,
     /// Parsing failed; the original error carries the Arabic message.
     Parse(RomError),
+    /// The cartridge mapper is not one M1 can execute.
+    UnsupportedMapper(u16),
+    /// The PRG image is not an NROM size (16/32 KiB).
+    BadPrgSize(usize),
+    /// A command argument is missing or malformed.
+    BadArgument(String),
+    /// The CPU halted (JAM opcode) during the run.
+    Halted { cycles: u64, instructions: u64 },
+    /// The trace log file could not be written.
+    TraceUnwritable,
 }
 
 impl std::fmt::Display for CommandError {
@@ -30,6 +45,22 @@ impl std::fmt::Display for CommandError {
                 write!(f, "تعذر فتح الملف أو قراءته — تحقق من المسار")
             }
             CommandError::Parse(err) => write!(f, "{err}"),
+            CommandError::UnsupportedMapper(mapper) => write!(
+                f,
+                "اللوحة رقم {mapper} غير مدعومة بعد — M1 ينفّذ NROM (اللوحة 0) فقط؛ عائلات اللوحات تصل في M3 وما بعدها"
+            ),
+            CommandError::BadPrgSize(size) => write!(
+                f,
+                "حجم PRG ({size} بايت) ليس من أحجام NROM (16 أو 32 كيلوبايت) — لا نخمّن تخطيطًا غير موثّق"
+            ),
+            CommandError::BadArgument(message) => write!(f, "وسيط غير صالح: {message}"),
+            CommandError::Halted { cycles, instructions } => write!(
+                f,
+                "توقف المعالج بامر JAM بعد {cycles} دورة و{instructions} تعليمة — الروم يحتاج إعادة تهيئة للاستئناف"
+            ),
+            CommandError::TraceUnwritable => {
+                write!(f, "تعذر كتابة ملف سجل التتبّع — تحقق من المسار والصلاحيات")
+            }
         }
     }
 }
@@ -37,6 +68,14 @@ impl std::fmt::Display for CommandError {
 impl From<RomError> for CommandError {
     fn from(err: RomError) -> Self {
         CommandError::Parse(err)
+    }
+}
+
+impl From<se_core::bus::BusError> for CommandError {
+    fn from(err: se_core::bus::BusError) -> Self {
+        match err {
+            se_core::bus::BusError::UnsupportedPrgSize(size) => CommandError::BadPrgSize(size),
+        }
     }
 }
 
@@ -69,6 +108,23 @@ fn run(args: &[String]) -> u8 {
                 2
             }
         },
+        Some("run") => match args.get(2) {
+            Some(path) => match run_command(path, &args[3..]) {
+                Ok(report) => {
+                    println!("{report}");
+                    0
+                }
+                Err(err) => {
+                    eprintln!("خطأ: {err}");
+                    1
+                }
+            },
+            None => {
+                eprintln!("خطأ: الأمر run يحتاج مسار ملف ROM");
+                eprintln!("الاستعمال: se-cli run <ملف.nes> --frames N [--hash]");
+                2
+            }
+        },
         Some(other) => {
             eprintln!("خطأ: أمر غير معروف: {other}");
             print_usage();
@@ -81,6 +137,8 @@ fn print_usage() {
     println!("SheikhEmu (se-cli) — واجهة سطر الأوامر");
     println!("الاستعمال:");
     println!("  se-cli info <ملف.nes>   تقرير تفصيلي عن الكارتريدج");
+    println!("  se-cli run <ملف.nes> --frames N [--hash] [--trace-cpu <ملف>]");
+    println!("        [--instructions N] [--start-pc <عنوان-ست-عشري>]");
     println!("  se-cli -h | --help      هذه المساعدة");
 }
 
@@ -89,6 +147,201 @@ fn info_command(path: &str) -> Result<String, CommandError> {
     let data = fs::read(path).map_err(|_| CommandError::FileUnreadable)?;
     let rom = parse(&data)?;
     Ok(format_report(path, &rom))
+}
+
+/// How long a `run` lasts.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum RunLength {
+    /// A number of frames at the per-region cycle budget.
+    Frames(u32),
+    /// An exact instruction count (the calibration protocol).
+    Instructions(u64),
+}
+
+/// Options of the `run` command.
+#[derive(Debug)]
+struct RunOptions {
+    length: Option<RunLength>,
+    hash: bool,
+    trace: Option<String>,
+    start_pc: Option<u16>,
+}
+
+impl RunOptions {
+    /// Parse the flag list after the ROM path. No dependencies: plain
+    /// matching with Arabic error messages.
+    fn parse(flags: &[String]) -> Result<Self, CommandError> {
+        let mut options = RunOptions {
+            length: None,
+            hash: false,
+            trace: None,
+            start_pc: None,
+        };
+        let mut i = 0;
+        while i < flags.len() {
+            match flags[i].as_str() {
+                "--frames" => {
+                    let value = flags
+                        .get(i + 1)
+                        .and_then(|f| f.parse::<u32>().ok())
+                        .ok_or_else(|| {
+                            CommandError::BadArgument("--frames يحتاج رقمًا موجبًا".to_string())
+                        })?;
+                    options.length = Some(RunLength::Frames(value));
+                    i += 2;
+                }
+                "--instructions" => {
+                    let value = flags
+                        .get(i + 1)
+                        .and_then(|f| f.parse::<u64>().ok())
+                        .ok_or_else(|| {
+                            CommandError::BadArgument("--instructions يحتاج رقمًا موجبًا".to_string())
+                        })?;
+                    options.length = Some(RunLength::Instructions(value));
+                    i += 2;
+                }
+                "--hash" => {
+                    options.hash = true;
+                    i += 1;
+                }
+                "--trace-cpu" => {
+                    let value = flags.get(i + 1).ok_or_else(|| {
+                        CommandError::BadArgument("--trace-cpu يحتاج مسار ملف".to_string())
+                    })?;
+                    options.trace = Some(value.clone());
+                    i += 2;
+                }
+                "--start-pc" => {
+                    let text = flags.get(i + 1).ok_or_else(|| {
+                        CommandError::BadArgument("--start-pc يحتاج عنوانًا".to_string())
+                    })?;
+                    let cleaned = text.trim_start_matches("0x").trim_start_matches('$');
+                    options.start_pc = Some(u16::from_str_radix(cleaned, 16).map_err(|_| {
+                        CommandError::BadArgument(format!("عنوان غير صالح: {text}"))
+                    })?);
+                    i += 2;
+                }
+                other => {
+                    return Err(CommandError::BadArgument(other.to_string()));
+                }
+            }
+        }
+        if options.length.is_none() {
+            return Err(CommandError::BadArgument(
+                "حدّد مدة التشغيل: --frames N أو --instructions N".to_string(),
+            ));
+        }
+        Ok(options)
+    }
+}
+
+/// Region selection: the header decides, NTSC when absent (documented
+/// fallback), NTSC for multi-region boards (per their iNES 2.0 meaning).
+fn region_of(rom: &InesRom) -> Region {
+    match rom.timing {
+        Some(TimingRegion::Pal) => Region::Pal,
+        Some(TimingRegion::Dendy) => Region::Dendy,
+        Some(TimingRegion::Ntsc) | Some(TimingRegion::Multiple) | None => Region::Ntsc,
+    }
+}
+
+/// Execute a ROM headless and produce the Arabic run report.
+fn run_command(path: &str, flags: &[String]) -> Result<String, CommandError> {
+    let options = RunOptions::parse(flags)?;
+    let data = fs::read(path).map_err(|_| CommandError::FileUnreadable)?;
+    let rom = parse(&data)?;
+    if rom.mapper != 0 {
+        return Err(CommandError::UnsupportedMapper(rom.mapper));
+    }
+    let region = region_of(&rom);
+    let mut machine = Machine::new(rom.prg, region)?;
+
+    // Test-ROM automation entry (nestest convention) or a real reset.
+    match options.start_pc {
+        Some(pc) => machine.start_automation(pc),
+        None => machine.reset(),
+    }
+
+    // Optional trace writer (reference line format).
+    let trace_handle = options
+        .trace
+        .as_ref()
+        .map(|file| fs::File::create(file).map_err(|_| CommandError::TraceUnwritable));
+    let mut trace_writer = match trace_handle {
+        Some(result) => Some(BufWriter::new(result?)),
+        None => None,
+    };
+
+    let mut halted = None;
+    let trace_one = |machine: &Machine, writer: &mut Option<BufWriter<fs::File>>| {
+        if let Some(w) = writer {
+            let line = format_trace_line(machine);
+            let _ = writeln!(w, "{line}");
+        }
+    };
+
+    match options.length.unwrap_or(RunLength::Frames(1)) {
+        RunLength::Instructions(count) => {
+            for _ in 0..count {
+                trace_one(&machine, &mut trace_writer);
+                if let Err(se_core::CpuError::Halted) = machine.step() {
+                    halted = Some((machine.cycle, machine.instructions));
+                    break;
+                }
+            }
+        }
+        RunLength::Frames(frames) => {
+            // Frame-by-frame so a trace stays readable frame by frame.
+            for _ in 0..frames {
+                let target = machine.cycle + se_core::machine::frame_cycles(region);
+                while machine.cycle < target {
+                    trace_one(&machine, &mut trace_writer);
+                    if let Err(se_core::CpuError::Halted) = machine.step() {
+                        halted = Some((machine.cycle, machine.instructions));
+                        break;
+                    }
+                }
+                if halted.is_some() {
+                    break;
+                }
+            }
+        }
+    }
+    if let Some(writer) = trace_writer.as_mut() {
+        writer.flush().map_err(|_| CommandError::TraceUnwritable)?;
+    }
+    if let Some((cycles, instructions)) = halted {
+        return Err(CommandError::Halted {
+            cycles,
+            instructions,
+        });
+    }
+
+    // The Arabic report.
+    let file_name = path.rsplit(['/', '\\']).next().unwrap_or(path);
+    let length_text = match options.length {
+        Some(RunLength::Frames(frames)) => format!("{frames} إطارًا"),
+        Some(RunLength::Instructions(count)) => format!("{count} تعليمات"),
+        None => String::new(),
+    };
+    let region_text = match region {
+        Region::Ntsc => "NTSC",
+        Region::Pal => "PAL",
+        Region::Dendy => "Dendy",
+    };
+    let mut report = String::new();
+    report.push_str(&format!("تقرير التشغيل: {file_name}\n"));
+    report.push_str(&format!("المنطقة: {region_text}\n"));
+    report.push_str(&format!("مدة التشغيل: {length_text}\n"));
+    report.push_str(&format!("الدورات المنفّذة: {}\n", machine.cycle));
+    report.push_str(&format!("التعليمات المنفّذة: {}\n", machine.instructions));
+    if let Some(file) = options.trace.as_deref() {
+        report.push_str(&format!("سجل التتبّع: {file}\n"));
+    }
+    if options.hash {
+        report.push_str(&format!("بصمة الحالة: {:016x}\n", machine.state_hash()));
+    }
+    Ok(report)
 }
 
 /// Human-readable sizes: KiB for round multiples, bytes otherwise.
@@ -275,6 +528,142 @@ mod tests {
         // `run` with only the program name prints usage and returns 0.
         let code = run(&["se-cli".to_string()]);
         assert_eq!(code, 0);
+    }
+
+    // ---- run command (M1) ---------------------------------------------------
+
+    /// 16 KiB NROM image whose program is an infinite NOP slide.
+    fn nop_rom() -> Vec<u8> {
+        let mut v = vec![
+            b'N', b'E', b'S', 0x1A, 1, 1, 0x00, 0x00, 0, 0, 0, 0, 0, 0, 0, 0,
+        ];
+        let mut prg = vec![0xEA; 16 * 1024];
+        prg[0x3FFA..0x4000].copy_from_slice(&[0x00, 0x80, 0x00, 0x80, 0x00, 0x80]);
+        v.extend(prg);
+        v.extend(vec![0x00; 8 * 1024]);
+        v
+    }
+
+    #[test]
+    fn run_reports_cycles_and_instructions_in_arabic() {
+        let path = temp_path("run");
+        fs::write(&path, nop_rom()).expect("write ROM");
+        let flags: [String; 2] = ["--frames".to_string(), "2".to_string()];
+        let report = run_command(path.to_str().expect("utf8"), &flags).expect("runs");
+        fs::remove_file(&path).ok();
+        assert!(report.contains("تقرير التشغيل"));
+        assert!(report.contains("المنطقة: NTSC"));
+        assert!(report.contains("الدورات المنفّذة:"));
+        assert!(report.contains("التعليمات المنفّذة:"));
+    }
+
+    #[test]
+    fn run_hash_is_deterministic() {
+        let path = temp_path("hash");
+        fs::write(&path, nop_rom()).expect("write ROM");
+        let flags: [String; 3] = [
+            "--frames".to_string(),
+            "2".to_string(),
+            "--hash".to_string(),
+        ];
+        let first = run_command(path.to_str().expect("utf8"), &flags).expect("runs");
+        let second = run_command(path.to_str().expect("utf8"), &flags).expect("runs");
+        fs::remove_file(&path).ok();
+        fn hash_line(report: &str) -> &str {
+            report
+                .lines()
+                .find(|line| line.contains("بصمة الحالة"))
+                .expect("hash line present")
+        }
+        assert_eq!(hash_line(&first), hash_line(&second));
+    }
+
+    #[test]
+    fn run_writes_a_reference_format_trace() {
+        let path = temp_path("trace");
+        fs::write(&path, nop_rom()).expect("write ROM");
+        let trace_path = temp_path("trace-log").with_extension("log");
+        let trace = trace_path.to_str().expect("utf8").to_string();
+        let flags: [String; 4] = [
+            "--instructions".to_string(),
+            "2".to_string(),
+            "--trace-cpu".to_string(),
+            trace.clone(),
+        ];
+        let report = run_command(path.to_str().expect("utf8"), &flags).expect("runs");
+        fs::remove_file(&path).ok();
+        assert!(report.contains("سجل التتبّع"));
+        let log = fs::read_to_string(&trace_path).expect("trace written");
+        fs::remove_file(&trace_path).ok();
+        // First line: reset vector $8000, NOP, at cycle 7, PPU (0,21).
+        assert!(log.starts_with("8000  EA        NOP"), "got: {log}");
+        assert!(log.lines().count() == 2);
+    }
+
+    #[test]
+    fn run_start_pc_accepts_the_hex_forms() {
+        let path = temp_path("pc");
+        fs::write(&path, nop_rom()).expect("write ROM");
+        for form in ["C000", "0xC000", "$C000"] {
+            let flags: [String; 4] = [
+                "--instructions".to_string(),
+                "1".to_string(),
+                "--start-pc".to_string(),
+                form.to_string(),
+            ];
+            let report = run_command(path.to_str().expect("utf8"), &flags)
+                .unwrap_or_else(|_| panic!("start-pc form {form} rejected"));
+            assert!(report.contains("تقرير التشغيل"));
+        }
+        fs::remove_file(&path).ok();
+    }
+
+    #[test]
+    fn run_rejects_missing_length_and_unknown_flags() {
+        let path = temp_path("badflags");
+        fs::write(&path, nop_rom()).expect("write ROM");
+        let none: [String; 0] = [];
+        let err = run_command(path.to_str().expect("utf8"), &none).expect_err("needs length");
+        assert!(err.to_string().contains("وسيط غير صالح"));
+        let bad = ["--bogus".to_string()];
+        let err = run_command(path.to_str().expect("utf8"), &bad).expect_err("unknown flag");
+        assert!(err.to_string().contains("وسيط غير صالح"));
+        fs::remove_file(&path).ok();
+    }
+
+    #[test]
+    fn run_rejects_non_nrom_mappers_with_arabic_error() {
+        // Byte 6 high nibble carries the low mapper nibble: 0x10 = mapper 1.
+        let mut v = vec![
+            b'N', b'E', b'S', 0x1A, 1, 1, 0x10, 0x00, 0, 0, 0, 0, 0, 0, 0, 0,
+        ];
+        v.extend(vec![0xEA; 16 * 1024]);
+        v.extend(vec![0x00; 8 * 1024]);
+        let path = temp_path("mapper");
+        fs::write(&path, v).expect("write ROM");
+        let flags = ["--frames".to_string(), "1".to_string()];
+        let err = run_command(path.to_str().expect("utf8"), &flags).expect_err("mapper");
+        fs::remove_file(&path).ok();
+        let text = err.to_string();
+        assert!(text.contains("اللوحة رقم 1"));
+        assert!(text.contains("NROM"));
+    }
+
+    #[test]
+    fn run_reports_halted_cpu_in_arabic() {
+        let mut prg = vec![0x02; 16 * 1024]; // JAM slide.
+        prg[0x3FFA..0x4000].copy_from_slice(&[0x00, 0x80, 0x00, 0x80, 0x00, 0x80]);
+        let mut v = vec![
+            b'N', b'E', b'S', 0x1A, 1, 1, 0x00, 0x00, 0, 0, 0, 0, 0, 0, 0, 0,
+        ];
+        v.extend(prg);
+        v.extend(vec![0x00; 8 * 1024]);
+        let path = temp_path("jam");
+        fs::write(&path, v).expect("write ROM");
+        let flags = ["--frames".to_string(), "1".to_string()];
+        let err = run_command(path.to_str().expect("utf8"), &flags).expect_err("halts");
+        fs::remove_file(&path).ok();
+        assert!(err.to_string().contains("JAM"));
     }
 
     #[test]
