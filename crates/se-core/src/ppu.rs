@@ -42,6 +42,10 @@ pub enum Mirroring {
     /// Four-screen VRAM (iNES flag bit 3 set): 4 KiB of independent
     /// nametables.
     FourScreen,
+    /// MMC1 screen mode 0: every slot mirrors the first 1 KiB table.
+    OneScreenA,
+    /// MMC1 screen mode 1: every slot mirrors the second 1 KiB table.
+    OneScreenB,
 }
 
 /// Pattern-table memory: CHR-ROM from the cartridge or CHR-RAM.
@@ -158,6 +162,12 @@ pub struct Ppu {
     /// A read swallowed the upcoming set; the flag must not appear.
     swallow_set: bool,
 
+    /// The latched odd-frame skip decision: captured when dot 338 of
+    /// the pre-render line completes, before any later CPU write of
+    /// the cycle that contains dots 339-340 can arrive (the
+    /// ppu_vbl_nmi test 10 calibration).
+    skip_pending: bool,
+
     // ---- interrupt state -------------------------------------------------
     /// The latched "take an NMI at the next instruction boundary"
     /// signal (edge model; cleared by suppressing reads).
@@ -252,6 +262,7 @@ impl Ppu {
             odd_frame: false,
             vbl_set_dot: None,
             swallow_set: false,
+            skip_pending: false,
             nmi_pending: false,
             line_v: 0,
             sprites: [SpriteSlot::default(); 8],
@@ -335,13 +346,20 @@ impl Ppu {
             self.tick_rendering();
         }
 
+        // The odd-frame skip decision: captured when dot 338 of the
+        // pre-render line completes, so a $2001 write in the following
+        // CPU cycle (whose dots are 339-340) can no longer influence
+        // this frame's skip (the test-10 calibration point).
+        if self.pre_render_line() && self.dot == 338 {
+            self.skip_pending = self.odd_frame && mask_bg_enabled(self.mask);
+        }
+
         // ---- dot advance ----------------------------------------------
         self.dot += 1;
         let skip = self.region == Region::Ntsc
             && self.pre_render_line()
             && self.dot == 340
-            && self.odd_frame
-            && mask_bg_enabled(self.mask);
+            && self.skip_pending;
         if self.dot >= DOTS_PER_SCANLINE as u16 || skip {
             self.dot = 0;
             self.scanline += 1;
@@ -793,6 +811,8 @@ impl Ppu {
                 }
             }
             Mirroring::FourScreen => offset,
+            Mirroring::OneScreenA => offset & 0x03FF,
+            Mirroring::OneScreenB => 0x0400 | (offset & 0x03FF),
         }
     }
 
@@ -871,6 +891,23 @@ impl Ppu {
     /// CHR RAM bytes when the cartridge uses RAM (state hashing).
     pub fn chr_ram_bytes(&self) -> Option<&[u8; 0x2000]> {
         self.chr.ram_bytes()
+    }
+
+    /// Change the nametable mirroring (MMC1's dynamic screen mode).
+    ///
+    /// The VRAM is resized between the 2 KiB and 4 KiB layouts; the
+    /// extra bytes of a FourScreen switch start zeroed. This happens
+    /// on cartridge register writes, never inside the frame loop.
+    pub fn set_mirroring(&mut self, mirroring: Mirroring) {
+        let wanted = if mirroring == Mirroring::FourScreen {
+            0x1000
+        } else {
+            0x0800
+        };
+        if self.vram.len() != wanted {
+            self.vram.resize(wanted, 0);
+        }
+        self.mirroring = mirroring;
     }
 
     // ---- output ---------------------------------------------------------------

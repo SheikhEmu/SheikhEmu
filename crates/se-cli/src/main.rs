@@ -52,7 +52,7 @@ impl std::fmt::Display for CommandError {
             CommandError::Parse(err) => write!(f, "{err}"),
             CommandError::UnsupportedMapper(mapper) => write!(
                 f,
-                "اللوحة رقم {mapper} غير مدعومة بعد — M1 ينفّذ NROM (اللوحة 0) فقط؛ عائلات اللوحات تصل في M3 وما بعدها"
+                "اللوحة رقم {mapper} غير مدعومة بعد — المدعوم حاليًا: NROM (0) وMMC1 الأدنى (1، لوحة بوابة M2)؛ إطار اللوحات الكامل يصل في M3/M5"
             ),
             CommandError::BadPrgSize(size) => write!(
                 f,
@@ -83,6 +83,9 @@ impl From<se_core::bus::BusError> for CommandError {
     fn from(err: se_core::bus::BusError) -> Self {
         match err {
             se_core::bus::BusError::UnsupportedPrgSize(size) => CommandError::BadPrgSize(size),
+            se_core::bus::BusError::UnsupportedMapper(mapper) => {
+                CommandError::UnsupportedMapper(mapper)
+            }
         }
     }
 }
@@ -147,6 +150,7 @@ fn print_usage() {
     println!("  se-cli info <ملف.nes>   تقرير تفصيلي عن الكارتريدج");
     println!("  se-cli run <ملف.nes> --frames N [--hash] [--trace-cpu <ملف>]");
     println!("        [--instructions N] [--start-pc <عنوان-ست-عشري>] [--dump-frame <ملف.png>]");
+    println!("        [--dump-plane <ملف>]");
     println!("  se-cli -h | --help      هذه المساعدة");
 }
 
@@ -174,6 +178,7 @@ struct RunOptions {
     trace: Option<String>,
     start_pc: Option<u16>,
     dump_frame: Option<String>,
+    dump_plane: Option<String>,
 }
 
 impl RunOptions {
@@ -186,6 +191,7 @@ impl RunOptions {
             trace: None,
             start_pc: None,
             dump_frame: None,
+            dump_plane: None,
         };
         let mut i = 0;
         while i < flags.len() {
@@ -238,6 +244,13 @@ impl RunOptions {
                     options.dump_frame = Some(value.clone());
                     i += 2;
                 }
+                "--dump-plane" => {
+                    let value = flags.get(i + 1).ok_or_else(|| {
+                        CommandError::BadArgument("--dump-plane يحتاج مسار ملف".to_string())
+                    })?;
+                    options.dump_plane = Some(value.clone());
+                    i += 2;
+                }
                 other => {
                     return Err(CommandError::BadArgument(other.to_string()));
                 }
@@ -267,14 +280,18 @@ fn run_command(path: &str, flags: &[String]) -> Result<String, CommandError> {
     let options = RunOptions::parse(flags)?;
     let data = fs::read(path).map_err(|_| CommandError::FileUnreadable)?;
     let rom = parse(&data)?;
-    if rom.mapper != 0 {
+    // Mapper 0 (NROM) runs fully; mapper 1 runs through the minimal
+    // MMC1 of D-22 (the M2 gate ROM's board). Anything else waits for
+    // the mapper framework in M3/M5.
+    if !matches!(rom.mapper, 0 | 1) {
         return Err(CommandError::UnsupportedMapper(rom.mapper));
     }
     let region = region_of(&rom);
     // Cartridge data for the M2 bus: CHR (ROM banks, or 8 KiB RAM when
     // the board ships none — the documented mapper-0 convention), the
     // nametable mirroring, and PRG RAM (the battery bit or an explicit
-    // NES 2.0 size).
+    // NES 2.0 size; MMC1 boards in the gate's harness always carry
+    // the $6000 WRAM the blargg protocol needs — D-22).
     let chr = if rom.chr.is_empty() {
         Chr::Ram(Box::new([0; 0x2000]))
     } else {
@@ -285,8 +302,8 @@ fn run_command(path: &str, flags: &[String]) -> Result<String, CommandError> {
         Mirroring::Horizontal => CoreMirroring::Horizontal,
         Mirroring::FourScreen => CoreMirroring::FourScreen,
     };
-    let prg_ram = rom.battery || rom.prg_ram.is_some_and(|bytes| bytes > 0);
-    let mut machine = Machine::from_cartridge(rom.prg, chr, mirroring, prg_ram, region)?;
+    let prg_ram = rom.battery || rom.prg_ram.is_some_and(|bytes| bytes > 0) || rom.mapper == 1;
+    let mut machine = Machine::from_rom(rom.prg, rom.mapper, chr, mirroring, prg_ram, region)?;
 
     // Test-ROM automation entry (nestest convention) or a real reset.
     match options.start_pc {
@@ -379,6 +396,12 @@ fn run_command(path: &str, flags: &[String]) -> Result<String, CommandError> {
             machine.ppu().last_plane_hash()
         ));
     }
+    // The blargg $6000 protocol report (when the cartridge carries
+    // WRAM): the $DE $B0 signature, the status byte and the
+    // null-terminated text.
+    if machine.bus.prg_ram().is_some() {
+        report.push_str(&blargg_report(&machine));
+    }
     if let Some(file) = options.dump_frame.as_deref() {
         // Heap-allocated: the fixed RGB plane stays out of the stack.
         let mut rgb = Box::new([0u8; 256 * 240 * 3]);
@@ -387,7 +410,50 @@ fn run_command(path: &str, flags: &[String]) -> Result<String, CommandError> {
             .map_err(|_| CommandError::FrameUnwritable)?;
         report.push_str(&format!("صورة الإطار: {file}\n"));
     }
+    if let Some(file) = options.dump_plane.as_deref() {
+        // The raw palette-index plane (256x240 bytes): the golden
+        // comparison artifact for the self-made calibration ROMs.
+        fs::write(std::path::Path::new(file), machine.ppu().last_frame_plane())
+            .map_err(|_| CommandError::FrameUnwritable)?;
+        report.push_str(&format!("مستوى الإطار الخام: {file}\n"));
+    }
     Ok(report)
+}
+
+/// Read the blargg test protocol at `$6000-$7FFF` and render the
+/// Arabic report: the `$DE $B0` signature, the status byte
+/// (`$80` = still running, `$00` = all tests passed, `$01..` = the
+/// failing test number) and the null-terminated ASCII text.
+fn blargg_report(machine: &Machine) -> String {
+    let wram = machine.bus.prg_ram().expect("wram present");
+    let signature_ok = wram[1] == 0xDE && wram[2] == 0xB0;
+    let status = wram[0];
+    let text: String = wram[4..0x100]
+        .iter()
+        .take_while(|&&b| b != 0)
+        .map(|&b| b as char)
+        .collect();
+    let mut out = String::new();
+    out.push_str(&format!(
+        "بروتوكول blargg: {}\n",
+        if signature_ok {
+            "موقّع DEB0"
+        } else {
+            "بلا توقيع (الروم لم يكتب النتائج)"
+        }
+    ));
+    if !signature_ok {
+        return out;
+    }
+    match status {
+        0x80 => out.push_str("حالة الاختبار: ما زال يعمل (80)\n"),
+        0x00 => out.push_str("حالة الاختبار: نجاح كامل (00)\n"),
+        code => out.push_str(&format!("حالة الاختبار: فشل الرمز {code:02X} — راجع النص\n")),
+    }
+    if !text.is_empty() {
+        out.push_str(&format!("نص النتيجة: {text}\n"));
+    }
+    out
 }
 
 /// Human-readable sizes: KiB for round multiples, bytes otherwise.
@@ -678,10 +744,11 @@ mod tests {
     }
 
     #[test]
-    fn run_rejects_non_nrom_mappers_with_arabic_error() {
-        // Byte 6 high nibble carries the low mapper nibble: 0x10 = mapper 1.
+    fn run_rejects_unimplemented_mappers_with_arabic_error() {
+        // Byte 6 high nibble carries the low mapper nibble: 0x20 =
+        // mapper 2 (UNROM) — unsupported until the M3 mapper frame.
         let mut v = vec![
-            b'N', b'E', b'S', 0x1A, 1, 1, 0x10, 0x00, 0, 0, 0, 0, 0, 0, 0, 0,
+            b'N', b'E', b'S', 0x1A, 1, 1, 0x20, 0x00, 0, 0, 0, 0, 0, 0, 0, 0,
         ];
         v.extend(vec![0xEA; 16 * 1024]);
         v.extend(vec![0x00; 8 * 1024]);
@@ -691,8 +758,28 @@ mod tests {
         let err = run_command(path.to_str().expect("utf8"), &flags).expect_err("mapper");
         fs::remove_file(&path).ok();
         let text = err.to_string();
-        assert!(text.contains("اللوحة رقم 1"));
+        assert!(text.contains("اللوحة رقم 2"));
         assert!(text.contains("NROM"));
+    }
+
+    #[test]
+    fn run_accepts_the_minimal_mmc1_for_the_m2_gate() {
+        // Mapper 1 with a 32 KiB image (two 16 KiB banks) executes
+        // headless through the minimal MMC1 (D-22).
+        let mut v = vec![
+            b'N', b'E', b'S', 0x1A, 2, 0, 0x10, 0x00, 0, 0, 0, 0, 0, 0, 0, 0,
+        ];
+        let mut prg = vec![0xEA; 32 * 1024];
+        prg[0..3].copy_from_slice(&[0x4C, 0x00, 0x80]);
+        prg[0x3FFA..0x4000].copy_from_slice(&[0x00, 0x80, 0x00, 0x80, 0x00, 0x80]);
+        v.extend(prg);
+        let path = temp_path("mmc1");
+        fs::write(&path, v).expect("write ROM");
+        let flags = ["--frames".to_string(), "2".to_string()];
+        let report = run_command(path.to_str().expect("utf8"), &flags).expect("runs");
+        fs::remove_file(&path).ok();
+        assert!(report.contains("الإطارات المكتملة: 2"));
+        assert!(report.contains("بروتوكول blargg"));
     }
 
     #[test]

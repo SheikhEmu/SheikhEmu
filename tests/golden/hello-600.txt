@@ -2,9 +2,12 @@
 # Regenerate on purpose after engine changes:
 #   se-cli run tests/roms/hello.nes --frames 600 --hash
 # then update the hash= line (any change must be justified in DECISIONS.md).
-# 2026-11-12: re-baselined once for M2 (decision D-19, owner-approved
-# 2026-11-11): the state hash now covers the full PPU state and frames
-# are real PPU frame completions, so the M1 value a7c85a8f3421cfc0 no
-# longer applies. The determinism requirement itself is unchanged.
+# 2026-11-12: re-baselined for M2 (decision D-19, owner-approved
+#  2026-11-11). First M2 value 9b3f71bfc1fbb92b (the state hash started
+#  covering the full PPU state and frames became real PPU frame
+#  completions); then 40e5e5b7fbd0e05b when the minimal MMC1 of D-22
+#  added the mapper register bytes to the hashed state — both within
+#  the same M2 series and the same approved one-time re-baseline.
+# The determinism requirement itself is unchanged.
 frames=600
-hash=9b3f71bfc1fbb92b
+hash=40e5e5b7fbd0e05b

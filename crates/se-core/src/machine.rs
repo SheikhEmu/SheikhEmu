@@ -57,7 +57,7 @@ impl Machine {
         })
     }
 
-    /// Build a machine from cartridge data.
+    /// Build a machine from cartridge data (mapper 0 / NROM).
     pub fn from_cartridge(
         prg: Vec<u8>,
         chr: Chr,
@@ -65,7 +65,20 @@ impl Machine {
         prg_ram: bool,
         region: Region,
     ) -> Result<Self, BusError> {
-        let bus = NesBus::with_cartridge(prg, chr, mirroring, prg_ram, region)?;
+        Self::from_rom(prg, 0, chr, mirroring, prg_ram, region)
+    }
+
+    /// Build a machine for a mapper id (0 = NROM, 1 = the minimal
+    /// MMC1 of D-22).
+    pub fn from_rom(
+        prg: Vec<u8>,
+        mapper: u16,
+        chr: Chr,
+        mirroring: Mirroring,
+        prg_ram: bool,
+        region: Region,
+    ) -> Result<Self, BusError> {
+        let bus = NesBus::with_mapper(prg, mapper, chr, mirroring, prg_ram, region)?;
         Ok(Machine {
             cpu: Cpu::new(),
             bus,
@@ -192,6 +205,11 @@ impl Machine {
             hash = mix_u8(hash, *byte);
         }
         hash = mix_u8(hash, self.bus.latch());
+        let (m0, m1, m2, m3) = self.bus.mapper_state();
+        hash = mix_u8(hash, m0);
+        hash = mix_u8(hash, m1);
+        hash = mix_u8(hash, m2);
+        hash = mix_u8(hash, m3);
         if let Some(ram) = self.bus.prg_ram() {
             for byte in ram {
                 hash = mix_u8(hash, *byte);

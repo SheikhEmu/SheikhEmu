@@ -73,11 +73,160 @@ impl NromPrg {
     }
 }
 
+/// PRG mapping of the cartridge. Mapper 0 is the fixed NROM layout;
+/// the minimal mapper-1 (MMC1) PRG banking exists because the
+/// official M2 exit-gate ROM (`ppu_vbl_nmi`) is an MMC1 board —
+/// documented in DECISIONS.md (D-22); the full mapper framework and
+/// its verification matrix remain the M5 scope.
+#[derive(Clone, Debug)]
+enum Prg {
+    /// NROM: fixed 16 KiB mirrored or 32 KiB linear.
+    Nrom(NromPrg),
+    /// MMC1: 16 KiB bank units with the serial control registers.
+    Mmc1(Mmc1),
+}
+
+impl Prg {
+    /// Read a PRG byte at a CPU address in `$8000-$FFFF`.
+    fn read(&self, addr: u16) -> u8 {
+        match self {
+            Prg::Nrom(nrom) => nrom.read(addr),
+            Prg::Mmc1(mmc1) => mmc1.read(addr),
+        }
+    }
+
+    /// CPU write into `$8000-$FFFF`: NROM ignores it, MMC1 feeds its
+    /// serial registers.
+    fn write(&mut self, addr: u16, value: u8) {
+        if let Prg::Mmc1(mmc1) = self {
+            mmc1.write(addr, value);
+        }
+    }
+
+    /// Mapper state for the determinism hash.
+    fn state(&self) -> (u8, u8, u8, u8) {
+        match self {
+            Prg::Nrom(_) => (0, 0, 0, 0),
+            Prg::Mmc1(m) => (m.control, m.prg_bank, m.shift, m.bits),
+        }
+    }
+}
+
+/// The minimal MMC1 (mapper 1) implementation: the serial 5-bit
+/// register protocol, the four screen modes and the PRG banking
+/// modes, over a 16 KiB-banked image. CHR banking is not implemented
+/// because the gate cartridge ships CHR RAM (8 KiB), which the bank
+/// bits cannot move (documented limitation, D-22).
+#[derive(Clone, Debug)]
+struct Mmc1 {
+    image: Vec<u8>,
+    /// Register 0: screen mode bits 0-1, PRG mode bits 2-3.
+    control: u8,
+    /// The 5-bit serial shift accumulator and its bit counter.
+    shift: u8,
+    bits: u8,
+    /// Register 3: the PRG bank select.
+    prg_bank: u8,
+}
+
+impl Mmc1 {
+    /// Build from an image whose length is a multiple of 16 KiB.
+    fn new(image: Vec<u8>) -> Result<Self, BusError> {
+        if image.is_empty() || !image.len().is_multiple_of(0x4000) {
+            return Err(BusError::UnsupportedPrgSize(image.len()));
+        }
+        Ok(Mmc1 {
+            image,
+            // Power-up state: PRG mode 3 (switch $8000 / fixed
+            // $C000), screen mode 3.
+            control: 0x0C,
+            shift: 0,
+            bits: 0,
+            prg_bank: 0,
+        })
+    }
+
+    fn banks(&self) -> usize {
+        self.image.len() / 0x4000
+    }
+
+    /// The 16 KiB bank serving `$8000-$BFFF`.
+    fn low_bank(&self) -> usize {
+        let bank = usize::from(self.prg_bank & 0x0F);
+        match (self.control >> 2) & 3 {
+            0 => bank & !1, // 32 KiB switch: pair start.
+            1 => 0,         // fixed first bank.
+            _ => bank,      // 2/3: switchable low half.
+        }
+    }
+
+    /// The 16 KiB bank serving `$C000-$FFFF`.
+    fn high_bank(&self) -> usize {
+        let bank = usize::from(self.prg_bank & 0x0F);
+        let last = self.banks() - 1;
+        match (self.control >> 2) & 3 {
+            0 => (bank & !1) + 1, // 32 KiB switch: pair second.
+            1 => bank,            // switchable high half.
+            _ => last,            // 2/3: fixed last bank.
+        }
+    }
+
+    fn read(&self, addr: u16) -> u8 {
+        let bank = if addr < 0xC000 {
+            self.low_bank()
+        } else {
+            self.high_bank()
+        };
+        self.image[bank * 0x4000 + usize::from(addr & 0x3FFF)]
+    }
+
+    /// Feed one CPU write of the serial protocol.
+    ///
+    /// A write with bit 7 set resets the shifter (keeping the
+    /// current registers); otherwise the low bit accumulates, and
+    /// every fifth write latches into the register the address bits
+    /// 13-14 select.
+    fn write(&mut self, addr: u16, value: u8) {
+        if value & 0x80 != 0 {
+            self.shift = 0;
+            self.bits = 0;
+            // The documented reset side effect: PRG mode back to 3.
+            self.control = (self.control & 0x0F) | 0x0C;
+            return;
+        }
+        self.shift |= (value & 1) << self.bits;
+        self.bits += 1;
+        if self.bits == 5 {
+            let reg = (addr >> 13) & 3;
+            let latched = self.shift;
+            self.shift = 0;
+            self.bits = 0;
+            match reg {
+                0 => self.control = latched & 0x0F,
+                3 => self.prg_bank = latched & 0x0F,
+                _ => {} // CHR bank registers: no effect with 8 KiB RAM.
+            }
+        }
+    }
+
+    /// The screen mode the control register selects.
+    fn mirroring(&self) -> Mirroring {
+        match self.control & 3 {
+            0 => Mirroring::OneScreenA,
+            1 => Mirroring::OneScreenB,
+            2 => Mirroring::Vertical,
+            _ => Mirroring::Horizontal,
+        }
+    }
+}
+
 /// Failures while constructing a bus.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum BusError {
     /// PRG image size is not a supported NROM size (in bytes).
     UnsupportedPrgSize(usize),
+    /// The mapper id has no implementation yet.
+    UnsupportedMapper(u16),
 }
 
 impl std::fmt::Display for BusError {
@@ -87,17 +236,22 @@ impl std::fmt::Display for BusError {
                 f,
                 "PRG size {size} bytes is not an NROM size (16 or 32 KiB)"
             ),
+            BusError::UnsupportedMapper(mapper) => write!(
+                f,
+                "mapper {mapper} is not implemented (0 = NROM, 1 = the minimal MMC1)"
+            ),
         }
     }
 }
 
 impl std::error::Error for BusError {}
 
-/// The M2 CPU bus: RAM + NROM PRG + optional PRG RAM + the real PPU.
+/// The M2 CPU bus: RAM + NROM/MMC1 PRG + optional PRG RAM + the real
+/// PPU.
 #[derive(Clone, Debug)]
 pub struct NesBus {
     ram: [u8; RAM_BYTES],
-    prg: NromPrg,
+    prg: Prg,
     prg_ram: Option<Box<[u8; PRG_RAM_BYTES]>>,
     ppu: Ppu,
     region: Region,
@@ -112,11 +266,13 @@ pub struct NesBus {
 }
 
 impl NesBus {
-    /// Build a bus carrying just a PRG image (CHR-RAM 8 KiB, vertical
-    /// mirroring — the documented NROM-without-CHR convention).
+    /// Build a bus carrying just a PRG image (NROM, CHR-RAM 8 KiB,
+    /// vertical mirroring — the documented NROM-without-CHR
+    /// convention).
     pub fn new(prg: Vec<u8>, region: Region) -> Result<Self, BusError> {
-        Self::with_cartridge(
+        Self::with_mapper(
             prg,
+            0,
             Chr::Ram(Box::new([0; 0x2000])),
             Mirroring::Vertical,
             false,
@@ -124,8 +280,7 @@ impl NesBus {
         )
     }
 
-    /// Build a bus from cartridge data: PRG, CHR, nametable mirroring
-    /// and whether `$6000-$7FFF` PRG RAM is present.
+    /// Build a bus from cartridge data for mapper 0 (NROM).
     pub fn with_cartridge(
         prg: Vec<u8>,
         chr: Chr,
@@ -133,9 +288,28 @@ impl NesBus {
         prg_ram: bool,
         region: Region,
     ) -> Result<Self, BusError> {
+        Self::with_mapper(prg, 0, chr, mirroring, prg_ram, region)
+    }
+
+    /// Build a bus for a mapper (0 = NROM, 1 = the minimal MMC1 of
+    /// D-22). The initial nametable mirroring comes from the header;
+    /// MMC1 owns it dynamically afterwards.
+    pub fn with_mapper(
+        prg: Vec<u8>,
+        mapper: u16,
+        chr: Chr,
+        mirroring: Mirroring,
+        prg_ram: bool,
+        region: Region,
+    ) -> Result<Self, BusError> {
+        let prg = match mapper {
+            0 => Prg::Nrom(NromPrg::new(prg)?),
+            1 => Prg::Mmc1(Mmc1::new(prg)?),
+            other => return Err(BusError::UnsupportedMapper(other)),
+        };
         Ok(NesBus {
             ram: [0; RAM_BYTES],
-            prg: NromPrg::new(prg)?,
+            prg,
             prg_ram: prg_ram.then(|| Box::new([0u8; PRG_RAM_BYTES])),
             ppu: Ppu::new(region, chr, mirroring),
             region,
@@ -227,6 +401,11 @@ impl NesBus {
         self.latch
     }
 
+    /// Mapper register state for the determinism hash.
+    pub fn mapper_state(&self) -> (u8, u8, u8, u8) {
+        self.prg.state()
+    }
+
     /// Service a read against the devices (no clocking).
     fn service_read(&mut self, addr: u16) -> u8 {
         match addr {
@@ -278,7 +457,13 @@ impl NesBus {
                 }
             }
             0x8000..=0xFFFF => {
-                // NROM has no writeable PRG.
+                // Mapper writes: NROM ignores them, MMC1 latches its
+                // serial registers and owns the screen mode.
+                self.prg.write(addr, value);
+                if let Prg::Mmc1(mmc1) = &self.prg {
+                    let mirroring = mmc1.mirroring();
+                    self.ppu.set_mirroring(mirroring);
+                }
             }
             _ => {
                 // Unmapped writes are dropped.
