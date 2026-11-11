@@ -1,6 +1,6 @@
 [workspace]
 resolver = "2"
-members = ["crates/se-core"]
+members = ["crates/se-core", "crates/se-rom", "crates/se-cli"]
 
 [workspace.package]
 version = "0.1.0"

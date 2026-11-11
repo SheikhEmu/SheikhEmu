@@ -1,0 +1,9 @@
+[package]
+name = "se-rom"
+description = "SheikhEmu cartridge loader: iNES and NES 2.0 parsing"
+version.workspace = true
+edition.workspace = true
+publish.workspace = true
+
+[dependencies]
+se-core = { path = "../se-core" }
