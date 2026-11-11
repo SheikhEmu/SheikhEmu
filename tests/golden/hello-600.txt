@@ -1,0 +1,6 @@
+# SheikhEmu golden frame signature (self-made hello.nes only).
+# Regenerate on purpose after engine changes:
+#   se-cli run tests/roms/hello.nes --frames 600 --hash
+# then update the hash= line (any change must be justified in DECISIONS.md).
+frames=600
+hash=a7c85a8f3421cfc0

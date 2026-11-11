@@ -53,5 +53,7 @@ jobs:
         run: tools/check_files.sh
       - name: Size gate
         run: tools/size_check.sh
+      - name: Golden determinism gate
+        run: tools/check_golden.sh
       - name: Constant sniff (advisory)
         run: tools/constant_sniff.sh
