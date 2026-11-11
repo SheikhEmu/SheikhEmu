@@ -1,0 +1,11 @@
+[workspace]
+resolver = "2"
+members = ["crates/se-core"]
+
+[workspace.package]
+version = "0.1.0"
+edition = "2021"
+publish = false
+
+# NOTE: no external dependencies by design (zero-cost / zero-network rule).
+# The Rust standard library is the only dependency of the entire workspace.

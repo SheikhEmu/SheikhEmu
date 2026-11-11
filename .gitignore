@@ -1,0 +1,9 @@
+# Rust build output
+/target
+
+# Locally generated test ROM images (rebuilt via `make test-roms`)
+/tests/roms/*.nes
+/tests/roms/build/
+
+# Local environment
+.env
