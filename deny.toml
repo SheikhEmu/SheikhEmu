@@ -1,0 +1,26 @@
+# cargo-deny configuration.
+# The workspace currently has zero external dependencies; these settings
+# guard future additions.
+
+[advisories]
+unmaintained = "workspace"
+
+[licenses]
+allow = [
+    "GPL-3.0-or-later",
+    "MIT",
+    "Apache-2.0",
+    "Unicode-3.0",
+    "Zlib",
+    "BSD-3-Clause",
+    "0BSD",
+]
+confidence-threshold = 0.93
+
+[bans]
+multiple-versions = "deny"
+wildcards = "deny"
+
+[sources]
+unknown-registry = "deny"
+unknown-git = "deny"
