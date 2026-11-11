@@ -1,11 +1,15 @@
 //! 6502 CPU (2A03 core, no decimal mode) execution engine.
 //!
-//! The engine executes all 151 documented opcodes with cycle-accurate
-//! base timings, including the +1 page-cross penalty for indexed reads,
-//! the 2/3/4 cycle branch timing, the JMP `(ind)` page-wrap bug and the
-//! zero-page wrap of indexed zero-page modes. Undocumented opcodes are
-//! rejected with [`CpuError::UnsupportedOp`] instead of being executed or
-//! panicking; they arrive in M1.
+//! The engine executes all 256 opcodes — the 151 documented ones and
+//! the 105 undocumented ones — with cycle-accurate base timings,
+//! including the +1 page-cross penalty for indexed reads, the 2/3/4
+//! cycle branch timing, the JMP `(ind)` page-wrap bug and the zero-page
+//! wrap of indexed zero-page modes. Undocumented behavior follows the
+//! NESdev Wiki write-ups on unofficial opcodes; behaviors that are
+//! unstable on real hardware are marked `UNVERIFIED-DESIGN` (see
+//! DECISIONS.md) because the nestest calibration never executes them.
+//! The JAM/KIL family halts the CPU; [`Cpu::step`] then returns
+//! [`CpuError::Halted`] instead of panicking.
 //!
 //! The 2A03 has no decimal mode, so ADC/SBC ignore the D flag (the flag
 //! exists and CLD/SED manipulate it, but arithmetic is always binary).
@@ -18,8 +22,10 @@ use self::opcodes::{info, AddrMode, Mnemonic, OpInfo};
 
 /// CPU-visible memory bus.
 pub trait Bus {
-    /// Read one byte.
-    fn read(&self, addr: u16) -> u8;
+    /// Read one byte. Mutable because a real bus has read side effects
+    /// (the open-bus latch, registers that clear on read); the trace
+    /// logger uses side-effect-free peeks instead.
+    fn read(&mut self, addr: u16) -> u8;
     /// Write one byte.
     fn write(&mut self, addr: u16, value: u8);
 }
@@ -39,16 +45,16 @@ mod flags {
 /// Errors produced while executing an instruction.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum CpuError {
-    /// The opcode is undocumented and not executed in this milestone.
-    UnsupportedOp(u8),
+    /// The CPU was halted by a JAM/KIL opcode; only a reset resumes it.
+    Halted,
 }
 
 impl fmt::Display for CpuError {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
-            CpuError::UnsupportedOp(opcode) => write!(
+            CpuError::Halted => write!(
                 f,
-                "undocumented opcode 0x{opcode:02X} is not executed in M0"
+                "CPU halted by a JAM opcode; only a reset resumes execution"
             ),
         }
     }
@@ -71,6 +77,8 @@ pub struct Cpu {
     pub pc: u16,
     /// Status register `P`.
     pub p: u8,
+    /// Halted by a JAM/KIL opcode (stays until the state is reset).
+    pub halted: bool,
 }
 
 impl Cpu {
@@ -83,6 +91,7 @@ impl Cpu {
             sp: 0xFD,
             pc: 0,
             p: 0x34,
+            halted: false,
         }
     }
 
@@ -95,17 +104,44 @@ impl Cpu {
             y: self.y,
             sp: self.sp,
             p: self.p,
+            halted: self.halted,
         }
     }
 
     /// Fetch, decode and execute one instruction; returns the cycles used.
+    ///
+    /// All 256 opcodes execute; the only error is a halted CPU (JAM).
     pub fn step(&mut self, bus: &mut dyn Bus) -> Result<u8, CpuError> {
+        if self.halted {
+            return Err(CpuError::Halted);
+        }
         let opcode = self.fetch8(bus);
         let opinfo = info(opcode);
-        if !opinfo.official {
-            return Err(CpuError::UnsupportedOp(opcode));
-        }
         Ok(self.execute(bus, opinfo))
+    }
+
+    /// Service a hardware interrupt (NMI or IRQ).
+    ///
+    /// Seven cycles: the return address is pushed, `P` is pushed without
+    /// the B flag but with the unused bit set, the I flag is raised and
+    /// the PC is loaded from `vector` (NESdev Wiki, "CPU interrupts").
+    pub fn service_interrupt(&mut self, bus: &mut dyn Bus, vector: u16) -> u8 {
+        self.push16(bus, self.pc);
+        self.push(bus, self.p & !flags::B | flags::U);
+        self.p |= flags::I;
+        self.pc = self.read16(bus, vector);
+        7
+    }
+
+    /// Power-on / reset sequence: seven cycles, `S -= 3`, I set, PC from
+    /// `$FFFC` (NESdev Wiki, "Reset": the phantom stack pushes only
+    /// decrement S — nothing is written).
+    pub fn reset(&mut self, bus: &mut dyn Bus) -> u8 {
+        self.sp = self.sp.wrapping_sub(3);
+        self.p |= flags::I;
+        self.pc = self.read16(bus, 0xFFFC);
+        self.halted = false;
+        7
     }
 
     // ---- register and flag helpers -------------------------------------
@@ -149,7 +185,7 @@ impl Cpu {
         lo | hi << 8
     }
 
-    fn read16(&self, bus: &dyn Bus, addr: u16) -> u16 {
+    fn read16(&self, bus: &mut dyn Bus, addr: u16) -> u16 {
         let lo = u16::from(bus.read(addr));
         let hi = u16::from(bus.read(addr.wrapping_add(1)));
         lo | hi << 8
@@ -157,7 +193,7 @@ impl Cpu {
 
     /// Read a 16-bit pointer stored at a zero-page address; the high byte
     /// comes from `(zp + 1) & 0xFF`, wrapping inside page 0.
-    fn read16_zp(&self, bus: &dyn Bus, zp: u8) -> u16 {
+    fn read16_zp(&self, bus: &mut dyn Bus, zp: u8) -> u16 {
         let lo = u16::from(bus.read(u16::from(zp)));
         let hi = u16::from(bus.read(u16::from(zp.wrapping_add(1))));
         lo | hi << 8
@@ -165,7 +201,7 @@ impl Cpu {
 
     /// Read the target of `JMP (ind)` with the $xxFF page-wrap bug: the high
     /// byte comes from the start of the same page, not from the next page.
-    fn read16_indirect_buggy(&self, bus: &dyn Bus, ptr: u16) -> u16 {
+    fn read16_indirect_buggy(&self, bus: &mut dyn Bus, ptr: u16) -> u16 {
         let lo = u16::from(bus.read(ptr));
         let hi_addr = (ptr & 0xFF00) | (ptr.wrapping_add(1) & 0xFF);
         let hi = u16::from(bus.read(hi_addr));
@@ -558,30 +594,199 @@ impl Cpu {
                 self.p &= !flags::V;
                 opinfo.cycles
             }
-            M::Nop => opinfo.cycles,
+            M::Nop => {
+                // The official NOP is implied; the undocumented NOP
+                // variants still consume their operand and read the
+                // addressed byte (reads count for timing and the open
+                // bus latch, but the value is discarded).
+                if opinfo.mode == AddrMode::Imp {
+                    opinfo.cycles
+                } else {
+                    let (addr, crossed) = self.resolve(bus, opinfo.mode);
+                    let _ = bus.read(addr);
+                    self.read_cycles(opinfo, crossed)
+                }
+            }
 
-            // Undocumented mnemonics never reach execute(); step() rejects
-            // them first. This arm exists only to keep the match exhaustive.
-            M::Kil
-            | M::Slo
-            | M::Rla
-            | M::Sre
-            | M::Rra
-            | M::Sax
-            | M::Lax
-            | M::Sha
-            | M::Shx
-            | M::Shy
-            | M::Tas
-            | M::Las
-            | M::Dcp
-            | M::Isc
-            | M::Anc
-            | M::Alr
-            | M::Arr
-            | M::Sbx
-            | M::Usbc
-            | M::Ane => unreachable!("undocumented mnemonic reached execute()"),
+            // ---- undocumented opcodes (M1.4) -------------------------------
+            // Behavior per the NESdev Wiki write-ups on unofficial
+            // opcodes. The M1.5 nestest trace calibration verifies every
+            // opcode that nestest actually executes (all families below
+            // except the unstable ones, which nestest never runs).
+            M::Slo | M::Rla | M::Sre | M::Rra => {
+                // Read-modify-write combined with an accumulator op:
+                // SLO = ASL + ORA, RLA = ROL + AND, SRE = LSR + EOR and
+                // RRA = ROR + ADC, where the ADC consumes the carry the
+                // ROR just produced.
+                let (addr, _) = self.resolve(bus, opinfo.mode);
+                let value = bus.read(addr);
+                let old_carry = u8::from(self.carry());
+                let (result, carry) = match opinfo.mnemonic {
+                    M::Slo => (value << 1, value >> 7),
+                    M::Rla => ((value << 1) | old_carry, value >> 7),
+                    M::Sre => (value >> 1, value & 1),
+                    M::Rra => ((value >> 1) | old_carry << 7, value & 1),
+                    _ => unreachable!("rmw combine family"),
+                };
+                bus.write(addr, result);
+                self.set_flag(flags::C, carry != 0);
+                match opinfo.mnemonic {
+                    M::Slo => {
+                        self.a |= result;
+                        self.set_nz(self.a);
+                    }
+                    M::Rla => {
+                        self.a &= result;
+                        self.set_nz(self.a);
+                    }
+                    M::Sre => {
+                        self.a ^= result;
+                        self.set_nz(self.a);
+                    }
+                    M::Rra => self.do_add(result),
+                    _ => unreachable!("rmw combine family"),
+                }
+                opinfo.cycles
+            }
+
+            M::Sax => {
+                // SAX stores A & X and touches no flags.
+                let (addr, _) = self.resolve(bus, opinfo.mode);
+                bus.write(addr, self.a & self.x);
+                opinfo.cycles
+            }
+
+            M::Lax => {
+                // LAX loads A and X with the same byte. The immediate
+                // form (LXA) is unstable on real hardware; the simple
+                // "load both" model is used and marked UNVERIFIED-DESIGN
+                // in DECISIONS.md.
+                let (addr, crossed) = self.resolve(bus, opinfo.mode);
+                let m = bus.read(addr);
+                self.a = m;
+                self.x = m;
+                self.set_nz(m);
+                self.read_cycles(opinfo, crossed)
+            }
+
+            M::Dcp => {
+                // DCP decrements memory, then compares A with the result.
+                let (addr, _) = self.resolve(bus, opinfo.mode);
+                let result = bus.read(addr).wrapping_sub(1);
+                bus.write(addr, result);
+                self.do_cmp(self.a, result);
+                opinfo.cycles
+            }
+
+            M::Isc => {
+                // ISC increments memory, then SBCs the result into A.
+                let (addr, _) = self.resolve(bus, opinfo.mode);
+                let result = bus.read(addr).wrapping_add(1);
+                bus.write(addr, result);
+                self.do_add(!result);
+                opinfo.cycles
+            }
+
+            M::Anc | M::Alr | M::Arr | M::Sbx | M::Usbc | M::Ane => {
+                // Immediate-only undocumented operations.
+                let (addr, _) = self.resolve(bus, opinfo.mode);
+                let imm = bus.read(addr);
+                match opinfo.mnemonic {
+                    // ANC = AND, then C copies N (bit 7 of A).
+                    M::Anc => {
+                        self.a &= imm;
+                        self.set_nz(self.a);
+                        self.set_flag(flags::C, self.a & flags::N != 0);
+                    }
+                    // ALR = AND, then LSR A.
+                    M::Alr => {
+                        self.a &= imm;
+                        self.set_flag(flags::C, self.a & 1 != 0);
+                        self.a >>= 1;
+                        self.set_nz(self.a);
+                    }
+                    // ARR = AND, then rotate right through C with
+                    // V = bit6 ^ bit7 of the result.
+                    // UNVERIFIED-DESIGN: nestest never executes ARR; the
+                    // flag formula follows the public 6502 write-ups.
+                    M::Arr => {
+                        self.a &= imm;
+                        let bit0 = self.a & 1;
+                        let old_carry = u8::from(self.carry());
+                        self.a = (self.a >> 1) | old_carry << 7;
+                        self.set_flag(flags::C, bit0 != 0);
+                        let overflow = (self.a & 0x40) ^ (self.a & flags::N) != 0;
+                        self.set_flag(flags::V, overflow);
+                        self.set_nz(self.a);
+                    }
+                    // SBX subtracts the immediate from A & X into X.
+                    M::Sbx => {
+                        let t = self.a & self.x;
+                        self.set_flag(flags::C, t >= imm);
+                        self.x = t.wrapping_sub(imm);
+                        self.set_nz(self.x);
+                    }
+                    // USBC is a plain SBC immediate.
+                    M::Usbc => self.do_add(!imm),
+                    // ANE is unstable; the simple A & X & imm model is
+                    // used. UNVERIFIED-DESIGN (magic-constant variants).
+                    M::Ane => {
+                        self.a &= self.x & imm;
+                        self.set_nz(self.a);
+                    }
+                    _ => unreachable!("immediate undocumented family"),
+                }
+                opinfo.cycles
+            }
+
+            M::Sha | M::Shx | M::Shy | M::Tas => {
+                // Unstable stores AND-ed with the high address byte:
+                // SHA stores A & X, SHX/SHY store the index, TAS first
+                // copies A & X into S.
+                // UNVERIFIED-DESIGN: formulas from public write-ups;
+                // nestest never executes them, and the page-cross
+                // corruption variants are simplified away (documented in
+                // DECISIONS.md).
+                let (addr, _) = self.resolve(bus, opinfo.mode);
+                let and_mask = ((addr >> 8) as u8).wrapping_add(1);
+                match opinfo.mnemonic {
+                    M::Sha | M::Tas => {
+                        let t = self.a & self.x;
+                        if opinfo.mnemonic == M::Tas {
+                            self.sp = t;
+                        }
+                        bus.write(addr, t & and_mask);
+                    }
+                    M::Shx => {
+                        bus.write(addr, self.x & and_mask);
+                    }
+                    M::Shy => {
+                        bus.write(addr, self.y & and_mask);
+                    }
+                    _ => unreachable!("unstable store family"),
+                }
+                opinfo.cycles
+            }
+
+            M::Las => {
+                // LAS loads A, X and S with memory AND S.
+                // UNVERIFIED-DESIGN: per public write-ups; nestest never
+                // executes it.
+                let (addr, crossed) = self.resolve(bus, opinfo.mode);
+                let m = bus.read(addr);
+                self.sp &= m;
+                self.a = self.sp;
+                self.x = self.sp;
+                self.set_nz(self.a);
+                self.read_cycles(opinfo, crossed)
+            }
+
+            M::Kil => {
+                // JAM locks the CPU until a reset. Two cycles is the
+                // nominal count (nothing runs afterwards).
+                self.halted = true;
+                opinfo.cycles
+            }
         }
     }
 }
@@ -630,7 +835,7 @@ mod tests {
     }
 
     impl Bus for ArrayBus {
-        fn read(&self, addr: u16) -> u8 {
+        fn read(&mut self, addr: u16) -> u8 {
             self.mem[usize::from(addr)]
         }
         fn write(&mut self, addr: u16, value: u8) {
@@ -1196,24 +1401,308 @@ mod tests {
     // ---- undocumented -----------------------------------------------------
 
     #[test]
-    fn undocumented_opcodes_return_error_not_panic() {
-        for opcode in [0x02u8, 0x1A, 0x9C, 0xB3, 0xEB, 0xFF] {
+    fn jam_opcodes_halt_instead_of_panicking() {
+        for opcode in [
+            0x02u8, 0x12, 0x22, 0x32, 0x42, 0x52, 0x62, 0x72, 0x92, 0xB2, 0xD2, 0xF2,
+        ] {
             let (mut cpu, mut bus) = cpu_at(0xC000, &[opcode]);
-            let result = cpu.step(&mut bus);
-            assert_eq!(result, Err(CpuError::UnsupportedOp(opcode)));
-            // PC still advanced past the opcode byte only.
-            assert_eq!(cpu.pc, 0xC001);
+            // The JAM itself executes (nominal 2 cycles) and halts.
+            assert_eq!(cpu.step(&mut bus), Ok(2), "opcode {opcode:02X}");
+            assert!(cpu.halted);
+            assert_eq!(cpu.step(&mut bus), Err(CpuError::Halted));
         }
     }
 
+    // ---- unofficial opcode semantics (M1.4) --------------------------------
+
     #[test]
-    fn every_official_opcode_executes_without_panicking() {
-        // Structural sweep: for each official opcode, craft the operand bytes
-        // the mode requires, run once, and require the documented cycle
-        // count. This catches missing match arms and mis-decoded modes.
+    fn slo_shifts_memory_and_ors_into_a() {
+        // SLO zp ($07): memory <<= 1 with C = old bit7, A |= memory.
+        let (mut cpu, mut bus) = cpu_at(0xC000, &[0xA9, 0x01, 0x07, 0x10]);
+        bus.poke(0x0010, 0x81);
+        cpu.step(&mut bus).expect("LDA");
+        let cycles = cpu.step(&mut bus).expect("SLO");
+        assert_eq!(cycles, 5);
+        assert_eq!(bus.peek(0x0010), 0x02);
+        assert_eq!(cpu.a, 0x03);
+        assert!(cpu.p & C != 0);
+        assert!(cpu.p & N == 0);
+    }
+
+    #[test]
+    fn rla_rolls_memory_and_ands_into_a() {
+        // RLA zp ($27): memory = ROL(memory), A &= memory.
+        let (mut cpu, mut bus) = cpu_at(0xC000, &[0x38, 0xA9, 0xF0, 0x27, 0x11]);
+        bus.poke(0x0011, 0xB5);
+        cpu.step(&mut bus).expect("SEC");
+        cpu.step(&mut bus).expect("LDA");
+        let cycles = cpu.step(&mut bus).expect("RLA");
+        assert_eq!(cycles, 5);
+        // 0xB5 rolled left with C=1 gives 0x6B; new C = 1 (old bit7).
+        assert_eq!(bus.peek(0x0011), 0x6B);
+        assert_eq!(cpu.a, 0xF0 & 0x6B);
+        assert!(cpu.p & C != 0);
+        assert!(cpu.p & N == 0);
+    }
+
+    #[test]
+    fn sre_shifts_memory_and_xors_into_a() {
+        // SRE zp ($47): memory >>= 1 with C = old bit0, A ^= memory.
+        let (mut cpu, mut bus) = cpu_at(0xC000, &[0xA9, 0x55, 0x47, 0x12]);
+        bus.poke(0x0012, 0x07);
+        cpu.step(&mut bus).expect("LDA");
+        let cycles = cpu.step(&mut bus).expect("SRE");
+        assert_eq!(cycles, 5);
+        assert_eq!(bus.peek(0x0012), 0x03);
+        assert!(cpu.p & C != 0);
+        assert_eq!(cpu.a, 0x55 ^ 0x03);
+    }
+
+    #[test]
+    fn rra_uses_the_ror_carry_in_the_adc() {
+        // RRA zp ($67) with C=0: ROR(0xFF) = 0x7F with the new C = 1;
+        // ADC then computes 0x01 + 0x7F + 1 = 0x81.
+        let (mut cpu, mut bus) = cpu_at(0xC000, &[0x18, 0xA9, 0x01, 0x67, 0x20]);
+        bus.poke(0x0020, 0xFF);
+        cpu.step(&mut bus).expect("CLC");
+        cpu.step(&mut bus).expect("LDA");
+        let cycles = cpu.step(&mut bus).expect("RRA");
+        assert_eq!(cycles, 5);
+        assert_eq!(bus.peek(0x0020), 0x7F);
+        assert_eq!(cpu.a, 0x81);
+        // 0x81 fits in the byte: no carry out; N set; V set (+ + -).
+        assert!(cpu.p & C == 0);
+        assert!(cpu.p & N != 0);
+        assert!(cpu.p & V != 0);
+    }
+
+    #[test]
+    fn sax_stores_a_and_x() {
+        let (mut cpu, mut bus) = cpu_at(0xC000, &[0xA9, 0x3C, 0xA2, 0x0F, 0x87, 0x30]);
+        for _ in 0..2 {
+            cpu.step(&mut bus).expect("setup");
+        }
+        let cycles = cpu.step(&mut bus).expect("SAX");
+        assert_eq!(cycles, 3);
+        assert_eq!(bus.peek(0x0030), 0x3C & 0x0F);
+    }
+
+    #[test]
+    fn lax_loads_a_and_x() {
+        let (mut cpu, mut bus) = cpu_at(0xC000, &[0xA7, 0x40]);
+        bus.poke(0x0040, 0xC2);
+        let cycles = cpu.step(&mut bus).expect("LAX");
+        assert_eq!(cycles, 3);
+        assert_eq!(cpu.a, 0xC2);
+        assert_eq!(cpu.x, 0xC2);
+        assert!(cpu.p & N != 0);
+    }
+
+    #[test]
+    fn dcp_decrements_and_compares() {
+        let (mut cpu, mut bus) = cpu_at(0xC000, &[0xA9, 0x10, 0xC7, 0x50]);
+        bus.poke(0x0050, 0x05);
+        cpu.step(&mut bus).expect("LDA");
+        let cycles = cpu.step(&mut bus).expect("DCP");
+        assert_eq!(cycles, 5);
+        assert_eq!(bus.peek(0x0050), 0x04);
+        // A = 0x10 >= 0x04: carry set, result 0x0C (N clear, Z clear).
+        assert!(cpu.p & C != 0);
+        assert!(cpu.p & N == 0);
+        assert!(cpu.p & Z == 0);
+    }
+
+    #[test]
+    fn isc_increments_and_sbc() {
+        let (mut cpu, mut bus) = cpu_at(0xC000, &[0x38, 0xA9, 0x00, 0xE7, 0x60]);
+        bus.poke(0x0060, 0x00);
+        cpu.step(&mut bus).expect("SEC");
+        cpu.step(&mut bus).expect("LDA");
+        let cycles = cpu.step(&mut bus).expect("ISC");
+        assert_eq!(cycles, 5);
+        assert_eq!(bus.peek(0x0060), 0x01);
+        // 0x00 - 0x01 - 0: borrow out, result 0xFF.
+        assert_eq!(cpu.a, 0xFF);
+        assert!(cpu.p & C == 0);
+        assert!(cpu.p & N != 0);
+    }
+
+    #[test]
+    fn undocumented_nops_consume_operands() {
+        // NOP zp ($04) is 3 cycles and reads the byte.
+        let (mut cpu, mut bus) = cpu_at(0xC000, &[0x04, 0x10]);
+        assert_eq!(cpu.step(&mut bus), Ok(3));
+        assert_eq!(cpu.pc, 0xC002);
+
+        // NOP abs,X ($1C): 4 cycles, +1 when a page is crossed.
+        let (mut cpu, mut bus) = cpu_at(0xC000, &[0x1C, 0xF0, 0x02]);
+        cpu.x = 0x20;
+        assert_eq!(cpu.step(&mut bus), Ok(5));
+        assert_eq!(cpu.pc, 0xC003);
+
+        // Implied undocumented NOPs stay 2 cycles.
+        let (mut cpu, mut bus) = cpu_at(0xC000, &[0x1A]);
+        assert_eq!(cpu.step(&mut bus), Ok(2));
+    }
+
+    #[test]
+    fn anc_alr_and_sbx_semantics() {
+        // ANC imm ($0B): A &= imm; C = N.
+        let (mut cpu, mut bus) = cpu_at(0xC000, &[0xA9, 0x0F, 0x0B, 0xF0]);
+        cpu.step(&mut bus).expect("LDA");
+        assert_eq!(cpu.step(&mut bus), Ok(2));
+        assert_eq!(cpu.a, 0x00);
+        assert!(cpu.p & C == 0);
+        assert!(cpu.p & Z != 0);
+
+        // ALR imm ($4B): A &= imm then LSR.
+        let (mut cpu, mut bus) = cpu_at(0xC000, &[0xA9, 0x0F, 0x4B, 0x0F]);
+        cpu.step(&mut bus).expect("LDA");
+        assert_eq!(cpu.step(&mut bus), Ok(2));
+        assert_eq!(cpu.a, 0x07);
+        assert!(cpu.p & C != 0);
+
+        // SBX imm ($CB): X = (A & X) - imm, carry from the comparison.
+        let (mut cpu, mut bus) = cpu_at(0xC000, &[0xA9, 0xF0, 0xA2, 0x0F, 0xCB, 0x0A]);
+        cpu.step(&mut bus).expect("LDA");
+        cpu.step(&mut bus).expect("LDX");
+        assert_eq!(cpu.step(&mut bus), Ok(2));
+        assert_eq!(cpu.x, 0xF6);
+        assert!(cpu.p & C == 0);
+        assert!(cpu.p & N != 0);
+    }
+
+    #[test]
+    fn usbc_is_sbc_immediate() {
+        let (mut cpu, mut bus) = cpu_at(0xC000, &[0x38, 0xA9, 0x05, 0xEB, 0x03]);
+        cpu.step(&mut bus).expect("SEC");
+        cpu.step(&mut bus).expect("LDA");
+        assert_eq!(cpu.step(&mut bus), Ok(2));
+        assert_eq!(cpu.a, 0x02);
+        assert!(cpu.p & C != 0);
+    }
+
+    #[test]
+    fn unstable_store_family_writes_the_anded_value() {
+        // SHY abs,X ($9C): stores Y & (high byte + 1).
+        let (mut cpu, mut bus) = cpu_at(0xC000, &[0xA0, 0x3B, 0x9C, 0x00, 0x04]);
+        cpu.step(&mut bus).expect("LDY");
+        assert_eq!(cpu.step(&mut bus), Ok(5));
+        // Mask 0x04 + 1 = 0x05; 0x3B & 0x05 = 0x01.
+        assert_eq!(bus.peek(0x0400), 0x01);
+
+        // SHX abs,Y ($9E): stores X & (high byte + 1).
+        let (mut cpu, mut bus) = cpu_at(0xC000, &[0xA2, 0x6E, 0x9E, 0x00, 0x03]);
+        cpu.step(&mut bus).expect("LDX");
+        assert_eq!(cpu.step(&mut bus), Ok(5));
+        // Mask 0x03 + 1 = 0x04; 0x6E & 0x04 = 0x04.
+        assert_eq!(bus.peek(0x0300), 0x04);
+    }
+
+    #[test]
+    fn tas_and_las_model_the_documented_formulas() {
+        // TAS abs,Y ($9B): S = A & X; memory = S & (high byte + 1).
+        let (mut cpu, mut bus) = cpu_at(
+            0xC000,
+            &[0xA9, 0x37, 0xA2, 0x1F, 0xA0, 0x00, 0x9B, 0x00, 0x06],
+        );
+        for _ in 0..3 {
+            cpu.step(&mut bus).expect("setup");
+        }
+        assert_eq!(cpu.step(&mut bus), Ok(5));
+        assert_eq!(cpu.sp, 0x17);
+        assert_eq!(bus.peek(0x0600), 0x07);
+
+        // LAS abs,Y ($BB): A = X = S = memory & S.
+        let (mut cpu, mut bus) = cpu_at(0xC000, &[0xBB, 0x00, 0x05]);
+        bus.poke(0x0500, 0xFF);
+        assert_eq!(cpu.step(&mut bus), Ok(4));
+        assert_eq!(cpu.a, 0xFD);
+        assert_eq!(cpu.x, 0xFD);
+        assert_eq!(cpu.sp, 0xFD);
+    }
+
+    // ---- interrupts (M1.3) ---------------------------------------------------
+
+    #[test]
+    fn nmi_sequence_pushes_and_jumps_to_vector() {
+        let (mut cpu, mut bus) = cpu_at(0xC123, &[0xEA]);
+        bus.poke(0xFFFA, 0x00);
+        bus.poke(0xFFFB, 0xC0);
+        let cycles = cpu.service_interrupt(&mut bus, 0xFFFA);
+        assert_eq!(cycles, 7);
+        assert_eq!(cpu.pc, 0xC000);
+        assert!(cpu.p & I != 0);
+        assert_eq!(cpu.sp, 0xFA);
+        // Return address on the stack, high byte first.
+        assert_eq!(bus.peek(0x01FD), 0xC1);
+        assert_eq!(bus.peek(0x01FC), 0x23);
+        // P without the B flag, with the unused bit set.
+        assert_eq!(bus.peek(0x01FB), 0x24);
+    }
+
+    #[test]
+    fn irq_sequence_uses_vector_fffe() {
+        let (mut cpu, mut bus) = cpu_at(0x8005, &[0xEA]);
+        bus.poke(0xFFFE, 0x00);
+        bus.poke(0xFFFF, 0x90);
+        let cycles = cpu.service_interrupt(&mut bus, 0xFFFE);
+        assert_eq!(cycles, 7);
+        assert_eq!(cpu.pc, 0x9000);
+        assert!(cpu.p & I != 0);
+    }
+
+    #[test]
+    fn reset_decrements_sp_by_three_and_sets_i() {
+        let (mut cpu, mut bus) = cpu_at(0x0000, &[]);
+        bus.poke(0xFFFC, 0x00);
+        bus.poke(0xFFFD, 0xC0);
+        let cycles = cpu.reset(&mut bus);
+        assert_eq!(cycles, 7);
+        assert_eq!(cpu.pc, 0xC000);
+        assert_eq!(cpu.sp, 0xFA);
+        assert!(cpu.p & I != 0);
+    }
+
+    #[test]
+    fn rti_restores_the_interrupted_state() {
+        let (mut cpu, mut bus) = cpu_at(0xC123, &[0xEA]);
+        bus.poke(0xFFFA, 0x00);
+        bus.poke(0xFFFB, 0xC0);
+        bus.poke(0xC000, 0x40); // RTI at the NMI target.
+        cpu.service_interrupt(&mut bus, 0xFFFA);
+        assert_eq!(cpu.step(&mut bus), Ok(6));
+        assert_eq!(cpu.pc, 0xC123);
+        assert_eq!(cpu.sp, 0xFD);
+    }
+
+    #[test]
+    fn brk_pushes_b_set_service_interrupt_pushes_b_clear() {
+        // BRK pushes P with the B flag set; hardware interrupts push it
+        // clear. Both set the unused bit.
+        let (mut cpu, mut bus) = cpu_at(0xC000, &[0x00, 0xEA]);
+        bus.poke(0xFFFE, 0x50);
+        bus.poke(0xFFFF, 0xC0);
+        cpu.p = 0x24;
+        let cycles = cpu.step(&mut bus).expect("BRK");
+        assert_eq!(cycles, 7);
+        assert_eq!(bus.peek(0x01FB), 0x34);
+
+        let (mut cpu, mut bus) = cpu_at(0xC000, &[0xEA]);
+        cpu.p = 0x24;
+        cpu.service_interrupt(&mut bus, 0xFFFE);
+        assert_eq!(bus.peek(0x01FB), 0x24);
+    }
+
+    #[test]
+    fn every_opcode_executes_with_documented_cycles() {
+        // Structural sweep: for each of the 256 opcodes, craft the operand
+        // bytes the mode requires, run once, and require the documented
+        // cycle count. This catches missing match arms and mis-decoded
+        // modes. JAM opcodes halt instead and are covered above.
         for opcode in 0u8..=255 {
             let opinfo = info(opcode);
-            if !opinfo.official {
+            if opinfo.mnemonic == Mnemonic::Kil {
                 continue;
             }
             let pc: u16 = 0x0200;
