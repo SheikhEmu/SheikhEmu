@@ -60,8 +60,14 @@ def build_header(args: argparse.Namespace, prg_len: int,
     if not args.nes2 and mapper > 0xFF:
         raise SystemExit("mkrom: mappers above 255 require --nes2")
 
+    # iNES flags 6 bit 0: 0 = horizontal mirroring (vertical
+    # arrangement), 1 = vertical mirroring (horizontal arrangement).
+    # Fixed in the M2 fix session (2026-11-13): this encoder had the
+    # bit inverted, which canceled out against the equally inverted
+    # se-rom decoder for our own ROMs but would have produced
+    # spec-inverted files for anyone else.
     flags6 = (mapper & 0x0F) << 4
-    if args.mirroring == "h":
+    if args.mirroring == "v":
         flags6 |= 0x01
     elif args.mirroring == "4":
         flags6 |= 0x08

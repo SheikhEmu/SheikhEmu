@@ -227,12 +227,21 @@ pub fn parse(data: &[u8]) -> Result<InesRom, RomError> {
 
     let battery = flags6 & 0x02 != 0;
     let has_trainer = flags6 & 0x04 != 0;
+    // iNES flags 6 bit 0 (the spec wording): 0 = horizontal
+    // mirroring (vertical arrangement), 1 = vertical mirroring
+    // (horizontal arrangement). The bit names the CIRAM A10 wiring,
+    // NOT the visual stacking; the two names in parentheses describe
+    // the same setting from the other side. Fixed in the M2 fix
+    // session (2026-11-13): the mapping was previously inverted,
+    // which canceled out against the equally inverted mkrom.py
+    // encoder for the self-made ROMs but silently flipped external
+    // ROMs (oam_read et al. render through the wrong nametable).
     let mirroring = if flags6 & 0x08 != 0 {
         Mirroring::FourScreen
     } else if flags6 & 0x01 != 0 {
-        Mirroring::Horizontal
-    } else {
         Mirroring::Vertical
+    } else {
+        Mirroring::Horizontal
     };
 
     // Slice the data areas out of the file.
@@ -354,13 +363,24 @@ mod tests {
         assert_eq!(rom.submapper, 0);
         assert_eq!(rom.prg.len(), 16 * 1024);
         assert_eq!(rom.chr.len(), 8 * 1024);
-        assert_eq!(rom.mirroring, Mirroring::Vertical);
+        assert_eq!(rom.mirroring, Mirroring::Horizontal);
         assert!(!rom.battery);
         assert!(rom.trainer.is_none());
         assert!(rom.timing.is_none());
         assert!(rom.prg_ram.is_none() && rom.prg_nvram.is_none());
         assert!(rom.misc_rom.is_empty());
         assert!(rom.warnings.is_empty());
+    }
+
+    #[test]
+    fn flags6_bit0_one_is_vertical_mirroring() {
+        // Spec: bit 0 set = vertical mirroring (horizontal
+        // arrangement); bit 0 clear = horizontal mirroring. This is
+        // the exact inversion that broke the external test ROMs.
+        let mut v = nrom(16 * 1024, 8 * 1024);
+        v[6] = 0x01; // vertical mirroring
+        let rom = parse(&v).expect("valid");
+        assert_eq!(rom.mirroring, Mirroring::Vertical);
     }
 
     #[test]
@@ -396,7 +416,12 @@ mod tests {
     #[test]
     fn battery_and_mirroring_bits() {
         let mut v = nrom(16 * 1024, 8 * 1024);
-        v[6] = 0x03; // horizontal mirroring + battery
+        v[6] = 0x03; // vertical mirroring + battery
+        let rom = parse(&v).expect("valid");
+        assert_eq!(rom.mirroring, Mirroring::Vertical);
+        assert!(rom.battery);
+
+        v[6] = 0x02; // horizontal mirroring + battery only
         let rom = parse(&v).expect("valid");
         assert_eq!(rom.mirroring, Mirroring::Horizontal);
         assert!(rom.battery);
