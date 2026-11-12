@@ -169,6 +169,14 @@ impl Machine {
         self.bus.ppu().position()
     }
 
+    /// Push a live button snapshot for one controller port (the
+    /// host-side input injection point: CLI script, autopilot,
+    /// frontend keyboard). The snapshot is latched inside the pads at
+    /// the next strobe.
+    pub fn set_controller_buttons(&mut self, port: u8, buttons: u8) {
+        self.bus.controllers_mut().set_live(port, buttons);
+    }
+
     /// The PPU (frames, planes, protocol reads).
     pub fn ppu(&self) -> &Ppu {
         self.bus.ppu()
@@ -425,5 +433,52 @@ mod tests {
         assert_eq!(machine.step(), Ok(2));
         assert!(machine.cpu.halted);
         assert_eq!(machine.step(), Err(CpuError::Halted));
+    }
+
+    /// A program that polls joypad 1 once (strobe + 8 reads) and
+    /// stores the report at $0010..$0017, then loops.
+    fn polling_prg() -> Vec<u8> {
+        let mut code: Vec<u8> = Vec::new();
+        // LDA #1; STA $4016 (strobe high)
+        code.extend_from_slice(&[0xA9, 0x01, 0x8D, 0x16, 0x40]);
+        // LDA #0; STA $4016 (strobe low)
+        code.extend_from_slice(&[0xA9, 0x00, 0x8D, 0x16, 0x40]);
+        // LDX #0
+        code.extend_from_slice(&[0xA2, 0x00]);
+        // loop: LDA $4016; AND #1; STA $10,X; INX; CPX #8; BNE loop
+        let loop_start = code.len() as u16;
+        code.extend_from_slice(&[0xAD, 0x16, 0x40]); // lda $4016
+        code.extend_from_slice(&[0x29, 0x01]); // and #1
+        code.extend_from_slice(&[0x95, 0x10]); // sta $10,x (zp,x)
+        code.extend_from_slice(&[0xE8]); // inx
+        code.extend_from_slice(&[0xE0, 0x08]); // cpx #8
+        let back = loop_start.wrapping_sub((code.len() as u16) + 2);
+        code.extend_from_slice(&[0xD0, (back as i8) as u8]); // bne loop
+                                                             // JMP $8000 (an infinite slide, deterministic forever).
+        code.extend_from_slice(&[0x4C, 0x00, 0x80]);
+        let mut prg = vec![0xEA; 16 * 1024];
+        prg[0..code.len()].copy_from_slice(&code);
+        prg[0x3FFA..0x4000].copy_from_slice(&[0x00, 0x80, 0x00, 0x80, 0x00, 0x80]);
+        prg
+    }
+
+    #[test]
+    fn a_polled_controller_report_lands_in_ram() {
+        use crate::input::BTN_A;
+        let mut machine = Machine::new(polling_prg(), Region::Ntsc).expect("prg");
+        machine.reset();
+        machine.set_controller_buttons(0, BTN_A);
+        machine.run_frames(1).expect("poll");
+        let ram = machine.bus.ram();
+        assert_eq!(ram[0x10], 1, "slot A");
+        for slot in 1..8 {
+            assert_eq!(ram[0x10 + slot], 0, "slot {slot} released");
+        }
+        // Same program, same buttons -> same hash (input determinism).
+        let mut twin = Machine::new(polling_prg(), Region::Ntsc).expect("prg");
+        twin.reset();
+        twin.set_controller_buttons(0, BTN_A);
+        twin.run_frames(1).expect("poll");
+        assert_eq!(machine.state_hash(), twin.state_hash());
     }
 }

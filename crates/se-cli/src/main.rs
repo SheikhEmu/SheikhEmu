@@ -41,6 +41,10 @@ enum CommandError {
     TraceUnwritable,
     /// The frame dump PNG could not be written.
     FrameUnwritable,
+    /// The input script file could not be opened.
+    ScriptUnreadable,
+    /// The input script could not be parsed (Arabic reason).
+    ScriptBad(String),
 }
 
 impl std::fmt::Display for CommandError {
@@ -68,6 +72,12 @@ impl std::fmt::Display for CommandError {
             }
             CommandError::FrameUnwritable => {
                 write!(f, "تعذر كتابة ملف صورة الإطار — تحقق من المسار والصلاحيات")
+            }
+            CommandError::ScriptUnreadable => {
+                write!(f, "تعذر فتح ملف سيناريو الإدخال — تحقق من المسار")
+            }
+            CommandError::ScriptBad(reason) => {
+                write!(f, "سيناريو الإدخال غير صالح: {reason}")
             }
         }
     }
@@ -136,6 +146,10 @@ fn run(args: &[String]) -> u8 {
                 2
             }
         },
+        Some("script-help") => {
+            print_script_help();
+            0
+        }
         Some(other) => {
             eprintln!("خطأ: أمر غير معروف: {other}");
             print_usage();
@@ -150,8 +164,80 @@ fn print_usage() {
     println!("  se-cli info <ملف.nes>   تقرير تفصيلي عن الكارتريدج");
     println!("  se-cli run <ملف.nes> --frames N [--hash] [--trace-cpu <ملف>]");
     println!("        [--instructions N] [--start-pc <عنوان-ست-عشري>] [--dump-frame <ملف.png>]");
-    println!("        [--dump-plane <ملف>]");
+    println!("        [--dump-plane <ملف>] [--input-script <ملف>]");
+    println!("  se-cli script-help    صيغة ملف سيناريو الإدخال");
     println!("  se-cli -h | --help      هذه المساعدة");
+}
+
+/// The `script-help` text: the input scenario file format (M3).
+fn print_script_help() {
+    println!("صيغة سيناريو الإدخال (يُطبّق على المتحكم الأول):");
+    println!("  كل سطر: رقم-الإطار [أسماء الأزرار...]");
+    println!("  رقم الإطار عددي من صفر؛ الحالة تسري من بداية ذلك الإطار حتى أقرب سطر لاحق.");
+    println!("  أسماء الأزرار: a b select start up down left right");
+    println!("  سطر رقم بلا أزرار = لا شيء مضغوط؛ الأسطر التي تبدأ بـ # تعليقات.");
+    println!("مثال:");
+    println!("  0");
+    println!("  30 start");
+    println!("  120 left");
+}
+
+/// A deterministic input scenario: button snapshots applied to
+/// controller 1 at frame boundaries (the frame index counts
+/// completed frames; entry N applies from the start of frame N).
+#[derive(Debug)]
+struct InputScript {
+    schedule: Vec<(u32, u8)>,
+}
+
+impl InputScript {
+    /// Parse the scenario text. Plain matching with Arabic errors.
+    fn parse(text: &str) -> Result<Self, String> {
+        use se_core::{BTN_A, BTN_B, BTN_DOWN, BTN_LEFT, BTN_RIGHT, BTN_SELECT, BTN_START, BTN_UP};
+        let mut schedule: Vec<(u32, u8)> = Vec::new();
+        for (index, raw) in text.lines().enumerate() {
+            let line = raw.trim();
+            if line.is_empty() || line.starts_with('#') {
+                continue;
+            }
+            let mut parts = line.split_whitespace();
+            let frame_text = parts.next().unwrap_or_default();
+            let frame = frame_text
+                .parse::<u32>()
+                .map_err(|_| format!("السطر {}: رقم إطار غير صالح: {frame_text}", index + 1))?;
+            let mut buttons = 0u8;
+            for name in parts {
+                buttons |= match name.to_ascii_lowercase().as_str() {
+                    "a" => BTN_A,
+                    "b" => BTN_B,
+                    "select" => BTN_SELECT,
+                    "start" => BTN_START,
+                    "up" => BTN_UP,
+                    "down" => BTN_DOWN,
+                    "left" => BTN_LEFT,
+                    "right" => BTN_RIGHT,
+                    other => {
+                        return Err(format!("السطر {}: اسم زر غير معروف: {other}", index + 1));
+                    }
+                };
+            }
+            schedule.push((frame, buttons));
+        }
+        // Frame order tolerance: sort, then let the last entry at a
+        // duplicated frame supersede earlier ones.
+        schedule.sort_by_key(|(frame, _)| *frame);
+        let mut merged: Vec<(u32, u8)> = Vec::new();
+        for (frame, buttons) in schedule {
+            if let Some(last) = merged.last_mut() {
+                if last.0 == frame {
+                    last.1 = buttons;
+                    continue;
+                }
+            }
+            merged.push((frame, buttons));
+        }
+        Ok(InputScript { schedule: merged })
+    }
 }
 
 /// Parse `path` and produce the Arabic cartridge report.
@@ -179,6 +265,7 @@ struct RunOptions {
     start_pc: Option<u16>,
     dump_frame: Option<String>,
     dump_plane: Option<String>,
+    input_script: Option<String>,
 }
 
 impl RunOptions {
@@ -192,6 +279,7 @@ impl RunOptions {
             start_pc: None,
             dump_frame: None,
             dump_plane: None,
+            input_script: None,
         };
         let mut i = 0;
         while i < flags.len() {
@@ -249,6 +337,13 @@ impl RunOptions {
                         CommandError::BadArgument("--dump-plane يحتاج مسار ملف".to_string())
                     })?;
                     options.dump_plane = Some(value.clone());
+                    i += 2;
+                }
+                "--input-script" => {
+                    let value = flags.get(i + 1).ok_or_else(|| {
+                        CommandError::BadArgument("--input-script يحتاج مسار ملف".to_string())
+                    })?;
+                    options.input_script = Some(value.clone());
                     i += 2;
                 }
                 other => {
@@ -311,6 +406,19 @@ fn run_command(path: &str, flags: &[String]) -> Result<String, CommandError> {
         None => machine.reset(),
     }
 
+    // The input scenario (controller 1): snapshots applied at frame
+    // boundaries, before the frame runs (deterministic by
+    // construction — the same file gives the same run).
+    let script = match options.input_script.as_deref() {
+        Some(file) => Some(
+            InputScript::parse(
+                &fs::read_to_string(file).map_err(|_| CommandError::ScriptUnreadable)?,
+            )
+            .map_err(CommandError::ScriptBad)?,
+        ),
+        None => None,
+    };
+
     // Optional trace writer (reference line format).
     let trace_handle = options
         .trace
@@ -342,7 +450,19 @@ fn run_command(path: &str, flags: &[String]) -> Result<String, CommandError> {
         RunLength::Frames(frames) => {
             // Real PPU frames: each iteration runs to the next frame
             // completion so a trace stays readable frame by frame.
-            for _ in 0..frames {
+            // The input scenario advances at frame boundaries.
+            let mut script_cursor = 0usize;
+            let mut buttons = 0u8;
+            for frame_index in 0..frames {
+                if let Some(script) = &script {
+                    while script_cursor < script.schedule.len()
+                        && script.schedule[script_cursor].0 <= frame_index
+                    {
+                        buttons = script.schedule[script_cursor].1;
+                        script_cursor += 1;
+                    }
+                    machine.set_controller_buttons(0, buttons);
+                }
                 let target = machine.ppu().frame() + 1;
                 while machine.ppu().frame() < target {
                     trace_one(&machine, &mut trace_writer);
@@ -388,6 +508,10 @@ fn run_command(path: &str, flags: &[String]) -> Result<String, CommandError> {
     report.push_str(&format!("التعليمات المنفّذة: {}\n", machine.instructions));
     if let Some(file) = options.trace.as_deref() {
         report.push_str(&format!("سجل التتبّع: {file}\n"));
+    }
+    if let Some(file) = options.input_script.as_deref() {
+        let events = script.as_ref().map(|s| s.schedule.len()).unwrap_or(0);
+        report.push_str(&format!("سيناريو الإدخال: {file} (أحداث: {events})\n"));
     }
     if options.hash {
         report.push_str(&format!("بصمة الحالة: {:016x}\n", machine.state_hash()));
@@ -811,5 +935,75 @@ mod tests {
     fn warning_display_is_in_arabic() {
         let text = Warning::DiskDudeGarbage.to_string();
         assert!(text.contains("DiskDude") || text.contains('ت'));
+    }
+
+    // ---- input script (M3) -------------------------------------------------
+
+    #[test]
+    fn input_script_parses_names_comments_and_dedups() {
+        let script =
+            InputScript::parse("# scenario\n\n0\n30 start\n30 left a\n60\n").expect("valid script");
+        use se_core::{BTN_A, BTN_LEFT};
+        // The later line at the same frame supersedes the earlier one.
+        assert_eq!(
+            script.schedule,
+            vec![(0, 0), (30, BTN_LEFT | BTN_A), (60, 0)]
+        );
+    }
+
+    #[test]
+    fn input_script_rejects_unknown_buttons_in_arabic() {
+        let err = InputScript::parse("10 turbo").expect_err("bad button");
+        assert!(err.contains("اسم زر غير معروف: turbo"));
+    }
+
+    #[test]
+    fn run_with_an_input_script_is_deterministic() {
+        let path = temp_path("script");
+        fs::write(&path, nop_rom()).expect("write ROM");
+        let script_path = temp_path("script-input").with_extension("txt");
+        fs::write(&script_path, "0\n10 start right\n20\n").expect("write script");
+        let script_text = script_path.to_str().expect("utf8").to_string();
+        let flags = [
+            "--frames".to_string(),
+            "3".to_string(),
+            "--hash".to_string(),
+            "--input-script".to_string(),
+            script_text.clone(),
+        ];
+        let first = run_command(path.to_str().expect("utf8"), &flags).expect("runs");
+        let second = run_command(path.to_str().expect("utf8"), &flags).expect("runs");
+        fs::remove_file(&path).ok();
+        fs::remove_file(&script_path).ok();
+        assert!(first.contains("سيناريو الإدخال"));
+        assert!(first.contains("أحداث: 3"));
+        fn hash_line(report: &str) -> &str {
+            report
+                .lines()
+                .find(|line| line.contains("بصمة الحالة"))
+                .expect("hash line present")
+        }
+        assert_eq!(hash_line(&first), hash_line(&second));
+    }
+
+    #[test]
+    fn run_reports_an_unreadable_script_in_arabic() {
+        let path = temp_path("script-missing");
+        fs::write(&path, nop_rom()).expect("write ROM");
+        let flags = [
+            "--frames".to_string(),
+            "1".to_string(),
+            "--input-script".to_string(),
+            "/definitely/not/a/script.txt".to_string(),
+        ];
+        let err = run_command(path.to_str().expect("utf8"), &flags).expect_err("missing");
+        fs::remove_file(&path).ok();
+        assert!(err.to_string().contains("سيناريو الإدخال"));
+    }
+
+    #[test]
+    fn script_help_prints_the_format() {
+        let code = run(&["se-cli".to_string(), "script-help".to_string()]);
+        assert_eq!(code, 0);
     }
 }

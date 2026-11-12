@@ -7,8 +7,11 @@
 //! | `$0000-$07FF`| 2 KiB internal RAM                                        |
 //! | `$0008-$1FFF`| mirrors of the RAM (repeat every `$0800`)                 |
 //! | `$2000-$3FFF`| PPU registers, mirrored every 8 bytes (real PPU in M2)    |
-//! | `$4000-$4017`| APU registers and IO (fixed `$FF` read until M4, D-18)   |
+//! | `$4000-$4013`| APU registers (fixed `$FF` read until M4, D-18)            |
 //! | `$4014`      | OAM DMA trigger (write launches the 513/514-cycle DMA)   |
+//! | `$4015`      | APU status (fixed `$FF` read until M4, D-18)             |
+//! | `$4016`      | strobe write (both joypads) / joypad 1 read (M3)        |
+//! | `$4017`      | joypad 2 read (APU frame counter write arrives in M4)    |
 //! | `$4018-$401F`| test-mode registers (unused)                              |
 //! | `$4020-$5FFF`| cartridge expansion area (open bus)                        |
 //! | `$6000-$7FFF`| PRG RAM when the cartridge declares it                     |
@@ -31,6 +34,7 @@
 //! register accesses land on their exact cycle inside an instruction.
 
 use crate::cpu::Bus;
+use crate::input::Controllers;
 use crate::ppu::{Chr, Mirroring, Ppu};
 use crate::timing::Region;
 
@@ -259,6 +263,8 @@ pub struct NesBus {
     /// Master CPU cycle count (advances by one per serviced access
     /// and by the DMA and true-up paths).
     cycles: u64,
+    /// The two standard controllers ($4016/$4017, M3).
+    pads: Controllers,
     /// Fractional dot accumulator: `acc += cpu_div` per cycle, and
     /// one PPU dot ticks per `ppu_div` accumulated (NTSC/Dendy 12/4
     /// = 3 dots; PAL 16/5 = 3.2 dots per cycle).
@@ -316,6 +322,7 @@ impl NesBus {
             latch: 0,
             cycles: 0,
             dot_acc: 0,
+            pads: Controllers::default(),
         })
     }
 
@@ -358,6 +365,18 @@ impl NesBus {
         &mut self.ppu
     }
 
+    /// The two controllers ($4016/$4017): live button snapshots are
+    /// pushed per frame by the host (CLI script / autopilot /
+    /// frontend keyboard) before the frame runs.
+    pub fn controllers_mut(&mut self) -> &mut Controllers {
+        &mut self.pads
+    }
+
+    /// A side-effect-free view of the controllers (trace logger).
+    pub fn controllers(&self) -> &Controllers {
+        &self.pads
+    }
+
     /// Read without side effects (no latch refresh, no register
     /// side effects); used by the trace logger and the check tools.
     pub fn peek(&self, addr: u16) -> u8 {
@@ -372,9 +391,11 @@ impl NesBus {
                     self.latch
                 }
             }
-            // APU and IO registers: the documented fixed $FF (the
-            // reference trace shows this constant; D-18) until the
-            // APU arrives in M4.
+            // Joypads: the current serial output, no shifter advance.
+            0x4016 => self.pads.peek(0),
+            0x4017 => self.pads.peek(1),
+            // APU registers: the documented fixed $FF (D-18) until
+            // the APU arrives in M4.
             0x4000..=0x4017 => 0xFF,
             0x6000..=0x7FFF => match &self.prg_ram {
                 Some(ram) => ram[usize::from(addr & 0x1FFF)],
@@ -417,7 +438,11 @@ impl NesBus {
                 // $2000/$2001/$2003/$2005/$2006 read as open bus.
                 _ => self.latch,
             },
-            // APU/IO: the fixed $FF (D-18); $4014 is write-only.
+            // Joypads (M3): $4016 = port 1, $4017 = port 2; a read
+            // advances the shifter (the real side effect).
+            0x4016 => self.pads.read(0),
+            0x4017 => self.pads.read(1),
+            // APU: the fixed $FF (D-18); $4014 is write-only.
             0x4000..=0x4017 => 0xFF,
             0x6000..=0x7FFF => match &self.prg_ram {
                 Some(ram) => ram[usize::from(addr & 0x1FFF)],
@@ -449,7 +474,12 @@ impl NesBus {
                 if addr == 0x4014 {
                     dma = Some(value);
                 }
-                // Other APU/IO writes are dropped until M4/M6.
+                // $4016 bit 0 strobes both joypads (M3); the APU
+                // registers (including the $4017 frame-counter
+                // write) arrive in M4.
+                if addr == 0x4016 {
+                    self.pads.write_strobe(value);
+                }
             }
             0x6000..=0x7FFF => {
                 if let Some(ram) = self.prg_ram.as_deref_mut() {
@@ -678,5 +708,31 @@ mod tests {
         // Peeking PPU space must not refresh the latch.
         let _ = bus.peek(0x2002);
         assert_eq!(bus.read(0x5000), 0x42);
+    }
+
+    #[test]
+    fn joypads_are_live_devices_with_the_strobe_protocol() {
+        let mut bus = NesBus::new(prg16(0), Region::Ntsc).expect("16 KiB PRG");
+        // No buttons pressed: strobe + 8 reads give a released report.
+        bus.write(0x4016, 1);
+        bus.write(0x4016, 0);
+        for _ in 0..8 {
+            assert_eq!(bus.read(0x4016) & 1, 0);
+        }
+        assert_eq!(bus.read(0x4016), 0x41, "after 8: official 1s");
+        // Press A on port 1: the next cycle reports it.
+        bus.controllers_mut().set_live(0, crate::input::BTN_A);
+        bus.write(0x4016, 1);
+        bus.write(0x4016, 0);
+        assert_eq!(bus.read(0x4016) & 1, 1, "slot A pressed");
+        assert_eq!(bus.read(0x4016) & 1, 0, "slot B released");
+        // Port 2 stays independent through $4017.
+        bus.controllers_mut().set_live(1, crate::input::BTN_RIGHT);
+        bus.write(0x4016, 1);
+        bus.write(0x4016, 0);
+        for slot in 0..7 {
+            assert_eq!(bus.read(0x4017) & 1, 0, "port 2 slot {slot}");
+        }
+        assert_eq!(bus.read(0x4017) & 1, 1, "port 2 Right pressed");
     }
 }
