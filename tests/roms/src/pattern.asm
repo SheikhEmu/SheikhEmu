@@ -11,9 +11,10 @@
 ; (the program uploads its own tiles through $2006/$2007 at setup).
 ;
 ; Observable behavior for the gates:
-;   $0200 counts completed frames (the vblank poll loop).
-;   $0201 counts executed splits (the sprite-0 poll loop escaped).
-;   The rendered frame itself is the golden evidence.
+;   zero page $10 counts completed frames (the vblank poll loop),
+;   $11 counts executed splits (the sprite-0 poll loop escaped),
+;   $12 is the hit-observed guard. The rendered frame itself is the
+;   golden evidence.
 
     .org $C000
 
@@ -92,11 +93,12 @@ nt_col:
     cmp #$1E
     bne nt_row
 
-    ; Attributes: 64 bytes alternating $00/$55/$AA/$FF quadrants.
+    ; Attributes: 64 bytes alternating $00/$55 quadrants (every other
+    ; byte flips: $00 -> $55 -> $00).
     ldx #$00
     lda #$00
 attr_loop:
-    eor $55             ; $00 -> $55 -> $00 ... every other byte flips
+    eor #$55           ; immediate xor with the constant $55
     sta $2007
     inx
     cpx #$40
@@ -187,9 +189,18 @@ main:
     sta $2006
     sta $2006           ; t = nametable 0, no scroll
 
-    ; Wait for the sprite-0 hit during the visible area.
+    ; Wait for THIS frame's sprite-0 hit. First spin until any stale
+    ; hit flag from the previous frame clears (the pre-render line
+    ; clears it at dot 1): the flag persists through the whole vblank,
+    ; so polling for it directly after the vblank reset would escape
+    ; immediately on the stale flag and fire the split before the
+    ; frame even starts (whole-frame tearing).
     lda #$00
     sta $12             ; guard: 0 until the hit is seen
+wait_clear:
+    lda $2002
+    and #$40
+    bne wait_clear
 hit_wait:
     lda $2002
     and #$40
