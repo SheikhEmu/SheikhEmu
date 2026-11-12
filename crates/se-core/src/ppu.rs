@@ -105,18 +105,27 @@ const VBLANK_SCANLINE: u16 = 241;
 ///
 /// The dot at which the vblank flag sets is `S` and a read of `$2002`
 /// is serviced while the PPU sits at position `P` (the next dot to
-/// tick, i.e. exactly the dots the read can still see happen).
+/// tick; the read's own CPU cycle then ticks dots `P..P+2`).
 ///
-/// * `P <= S <= P + SUPPRESS_BEFORE_DOTS` (read zero to two CPU
-///   cycles at/around the set): the read returns 0 and the set is
-///   swallowed entirely — the flag never appears this frame and the
-///   NMI edge never fires.
-/// * `S < P <= S + SUPPRESS_AFTER_DOTS` (read up to one CPU cycle
-///   after the set): the read returns 1 but the pending NMI is
+/// Hardware truth (tepples vbl_nmi_timing readme, verified against
+/// ppu_vbl_nmi 02-vbl_set_time / 06-suppression, in this pos
+/// convention):
+///
+/// * `P == S` (the set dot ticks inside the read's own cycle — the
+///   read lands one PPU clock before the set): the read returns 0 and
+///   the set is swallowed entirely — the flag never appears this
+///   frame and the NMI edge never fires.
+/// * `S < P <= S + SUPPRESS_AFTER_DOTS` (the set happened one or two
+///   dots before the read's position — reading zero to one PPU
+///   clock after the set): the read returns 1 but the pending NMI is
 ///   suppressed.
+/// * `P < S` otherwise (two or more clocks before): 0, and the set
+///   still happens normally — no swallow. A too-wide before-window
+///   here makes a polling loop periodically eat a whole frame's
+///   vblank (the pattern.nes split instability of this session).
 /// * Later reads: flag 1, NMI untouched.
-const SUPPRESS_BEFORE_DOTS: u32 = 8;
-const SUPPRESS_AFTER_DOTS: u32 = 3;
+const SUPPRESS_BEFORE_DOTS: u32 = 0;
+const SUPPRESS_AFTER_DOTS: u32 = 2;
 
 /// The PPU. Owns VRAM, palette, OAM and the pixel planes.
 #[derive(Clone, Debug)]
@@ -176,10 +185,18 @@ pub struct Ppu {
     // ---- per-line rendering state ------------------------------------------
     /// The scroll snapshot (a copy of `v`) of the current visible line.
     line_v: u16,
-    /// Sprite slots evaluated for the current line.
+    /// Sprite slots promoted for the line being rendered.
     sprites: [SpriteSlot; 8],
     sprites_in_line: u8,
     sprite_zero_in_line: bool,
+    /// Staging slots (the secondary OAM equivalent): filled by the
+    /// dot-65 evaluation for the *next* line, promoted into
+    /// `sprites` at the end of the sprite fetch phase (dot 320) so
+    /// the current line's pixels are never drawn with the next
+    /// line's sprite data.
+    next_sprites: [SpriteSlot; 8],
+    next_sprites_in_line: u8,
+    next_sprite_zero_in_line: bool,
 
     // ---- output -------------------------------------------------------------
     /// Palette-index plane of the frame in progress.
@@ -268,6 +285,9 @@ impl Ppu {
             sprites: [SpriteSlot::default(); 8],
             sprites_in_line: 0,
             sprite_zero_in_line: false,
+            next_sprites: [SpriteSlot::default(); 8],
+            next_sprites_in_line: 0,
+            next_sprite_zero_in_line: false,
             plane: Box::new([0; 256 * 240]),
             last_plane: Box::new([0; 256 * 240]),
         }
@@ -293,6 +313,16 @@ impl Ppu {
     /// Whether rendering is currently switched on (`$2001` bits 3/4).
     pub fn rendering_enabled(&self) -> bool {
         mask_rendering(self.mask)
+    }
+
+    /// Whether the beam is *actively* rendering right now: rendering
+    /// enabled in `$2001` AND the beam on a visible or pre-render
+    /// line. This is the gate the `$2004` access rules care about —
+    /// OAM writes (and the `$4014` DMA behind them) are honored
+    /// during vblank however `$2001` is set; they are dropped only
+    /// while the beam is actually rendering.
+    fn rendering_active(&self) -> bool {
+        mask_rendering(self.mask) && (self.visible() || self.pre_render_line())
     }
 
     /// Dots processed inside the current frame (the position as a
@@ -414,9 +444,17 @@ impl Ppu {
             self.v = (self.v & !0x7BE0) | (self.t & 0x7BE0);
         }
 
-        // Sprite evaluation for the *next* line happens at dot 65.
-        if self.visible() && self.dot == 65 {
+        // Sprite evaluation for the *next* line is staged at dot 65
+        // (on the pre-render line too, so scanline 0 gets its sprites;
+        // evaluation for a vblank line would be discarded).
+        if (self.visible() || self.pre_render_line()) && self.dot == 65 {
             self.evaluate_sprites();
+        }
+
+        // The staged slots become the render slots at the end of the
+        // sprite fetch phase.
+        if (self.visible() || self.pre_render_line()) && self.dot == 320 {
+            self.commit_sprites();
         }
 
         // Pixel output at dots 2..=257 of visible lines.
@@ -457,28 +495,36 @@ impl Ppu {
     /// Sprite evaluation for the next scanline (B1 model: one pass at
     /// dot 65; the exact sub-dot sequence is a B2 item).
     ///
-    /// The OAM Y byte stores the sprite top *minus one* (the
-    /// documented hardware convention): a sprite with y=8 paints
-    /// rows 9..16.
+    /// The results land in the *staging* slots — the secondary OAM
+    /// equivalent. They are promoted into the render slots by
+    /// `commit_sprites` during the sprite fetch phase, so the
+    /// current line's pixels (dots 2..=257) are never drawn with the
+    /// next line's sprite data. The OAM Y byte stores the sprite top
+    /// *minus one* (the documented hardware convention): a sprite
+    /// with y=8 paints rows 9..16.
     fn evaluate_sprites(&mut self) {
         let tall = ctrl_tall_sprites(self.ctrl);
-        let next_line = ((self.scanline + 1) % self.scanlines()) as u8;
+        let next_line = (self.scanline + 1) % self.scanlines();
         let mut count = 0u8;
         let mut zero = false;
         let mut overflow_seen = false;
         for oam in 0..64usize {
             let y = self.oam[oam * 4];
-            let height: u8 = if tall { 16 } else { 8 };
+            let height: u16 = if tall { 16 } else { 8 };
             // In-range test with the minus-one convention: the sprite
-            // covers rows y+1 .. y+height.
-            let top = y.wrapping_add(1);
-            let dy = next_line.wrapping_sub(top);
-            if dy < height {
+            // covers rows y+1 .. y+height. The comparison is
+            // deliberately 16-bit WITHOUT wrap: OAM y=255 covers rows
+            // 256..263, off-screen forever (sprite_hit_tests 07
+            // subtest 4 — an 8-bit wrapping compare would pull that
+            // sprite onto scanline 0).
+            let top = u16::from(y) + 1;
+            let in_range = next_line >= top && next_line - top < height;
+            if in_range {
                 if count < 8 {
                     let attr = self.oam[oam * 4 + 2];
-                    let row = dy;
+                    let row = (next_line - top) as u8;
                     let row_eff = if attr & 0x80 != 0 {
-                        height - 1 - row
+                        (height - 1 - u16::from(row)) as u8
                     } else {
                         row
                     };
@@ -494,7 +540,7 @@ impl Ppu {
                     let addr = table | (u16::from(base) << 4) | u16::from(row_eff & 0x07);
                     let lo = self.chr.read(addr);
                     let hi = self.chr.read(addr | 0x0008);
-                    let slot = &mut self.sprites[usize::from(count)];
+                    let slot = &mut self.next_sprites[usize::from(count)];
                     slot.is_sprite_zero = oam == 0;
                     slot.attr = attr;
                     slot.lo = if attr & 0x40 != 0 {
@@ -517,14 +563,24 @@ impl Ppu {
                 }
             }
         }
-        for slot in self.sprites[usize::from(count)..].iter_mut() {
+        for slot in self.next_sprites[usize::from(count)..].iter_mut() {
             *slot = SpriteSlot::default();
         }
-        self.sprites_in_line = count;
-        self.sprite_zero_in_line = zero;
+        self.next_sprites_in_line = count;
+        self.next_sprite_zero_in_line = zero;
         if overflow_seen {
             self.overflow = true;
         }
+    }
+
+    /// Promote the staged (next-line) sprite slots into the render
+    /// slots at the end of the sprite fetch phase (dots 257..=320):
+    /// after the last pixel of the current line (dot 257) and before
+    /// the first pixel of the next (dot 2).
+    fn commit_sprites(&mut self) {
+        self.sprites = self.next_sprites;
+        self.sprites_in_line = self.next_sprites_in_line;
+        self.sprite_zero_in_line = self.next_sprite_zero_in_line;
     }
 
     /// Produce one pixel of output for screen column `x = dot - 2`.
@@ -543,8 +599,7 @@ impl Ppu {
 
         let mut spr: Option<(u8, bool, bool)> = None; // (entry, behind, is zero)
         if spr_showing {
-            for i in 0..usize::from(self.sprites_in_line) {
-                let slot = &self.sprites[i];
+            for slot in self.sprites[..usize::from(self.sprites_in_line)].iter() {
                 if x >= usize::from(slot.x) && x - usize::from(slot.x) < 8 {
                     let shift = 7 - (x - usize::from(slot.x));
                     let lo = (slot.lo >> shift) & 1;
@@ -684,27 +739,40 @@ impl Ppu {
         self.oam_addr = value;
     }
 
-    /// `$2004` read.
+    /// `$2004` read. Reads do NOT advance OAMADDR (sprite_ram rule
+    /// 4); the third byte of each entry reads back with its
+    /// unimplemented bits masked to `$E3` (sprite_ram rule 5);
+    /// during active rendering the value is corrupt — the B1
+    /// approximation returns `$FF` (the secondary-OAM detail is a
+    /// B2 item).
     pub fn read_oam(&mut self) -> u8 {
-        let value = if self.rendering_enabled() {
-            // B1 simplification: reads during rendering return $FF
-            // (documented simplification; the precise behavior is a
-            // B2 item).
-            0xFF
+        if self.rendering_active() {
+            return 0xFF;
+        }
+        let addr = usize::from(self.oam_addr);
+        if addr % 4 == 2 {
+            self.oam[addr] & 0xE3
         } else {
-            self.oam[usize::from(self.oam_addr)]
-        };
-        self.oam_addr = self.oam_addr.wrapping_add(1);
-        value
+            self.oam[addr]
+        }
     }
 
-    /// `$2004` write.
+    /// `$2004` write: honored whenever the beam is not actively
+    /// rendering — vblank included, which is the window the `$4014`
+    /// OAM DMA uses on real hardware; during visible/pre-render lines
+    /// with rendering enabled the write is dropped (the corrupted
+    /// write behavior is B2). The third byte of each entry stores
+    /// only its implemented bits (the `$E3` mask, so the state is
+    /// canonical).
     pub fn write_oam_data(&mut self, value: u8) {
-        if self.rendering_enabled() {
-            // B1: writes during rendering are ignored (the corrupted
-            // write behavior is B2).
+        if self.rendering_active() {
             return;
         }
+        let value = if usize::from(self.oam_addr) % 4 == 2 {
+            value & 0xE3
+        } else {
+            value
+        };
         self.oam[usize::from(self.oam_addr)] = value;
         self.oam_addr = self.oam_addr.wrapping_add(1);
     }
@@ -735,11 +803,18 @@ impl Ppu {
         }
     }
 
-    /// `$2007` read (buffered; the palette range is immediate).
+    /// `$2007` read (buffered; the palette range answers immediately
+    /// but still loads the read buffer with the VRAM behind the
+    /// palette mirror — the `$2F00-$2FFF` view — vram_access rule 6).
     pub fn read_data(&mut self) -> u8 {
         let addr = self.v & 0x3FFF;
         let value = if addr >= 0x3F00 {
-            self.palette_read(addr)
+            // The palette byte itself is returned unbuffered...
+            let immediate = self.palette_read(addr);
+            // ...while the buffer takes the nametable byte under the
+            // palette mirror for the NEXT read.
+            self.read_buffer = self.vram_read(addr & 0x2FFF);
+            immediate
         } else {
             let buffered = self.read_buffer;
             self.read_buffer = self.vram_read(addr);
@@ -1181,29 +1256,40 @@ mod tests {
     }
 
     #[test]
-    fn read_status_swallows_an_imminent_set() {
-        let mut ppu = ppu_ntsc_chr_ram(Mirroring::Vertical);
-        ppu.write_ctrl(0x80);
-        // Run to two cycles before the set dot, then read.
-        while ppu.position() != (241, 0) {
-            ppu.tick();
-        }
-        ppu.tick(); // position is now (241, 2) — the set dot was 1.
-                    // Position (241,2) is three dots past the set-dot... use the
-                    // earlier point instead: back up to just before the set.
-                    // (The tick above advanced past dot 1; rebuild the state.)
+    fn read_status_swallows_only_the_one_clock_before_read() {
+        // A read landing two PPU clocks before the set (position
+        // (241,0); the set dot is (241,1)) must NOT swallow it: the
+        // flag still appears and the NMI edge still fires
+        // (vbl_nmi_timing 2.vbl_timing rules 4/5 and 5.nmi_suppression
+        // rule 5 — the too-wide window here was the M2-fix session's
+        // split instability).
         let mut ppu = ppu_ntsc_chr_ram(Mirroring::Vertical);
         ppu.write_ctrl(0x80);
         while ppu.position() != (241, 0) {
             ppu.tick();
         }
-        // Read at the cycle whose dots contain the set dot.
         let value = ppu.read_status(0);
         assert_eq!(value & 0x80, 0x00, "the flag is not set yet");
-        // The imminent set must be swallowed: the flag never appears.
-        ppu.tick();
-        ppu.tick();
-        ppu.tick();
+        while ppu.position() != (241, 8) {
+            ppu.tick();
+        }
+        assert!(ppu.vblank, "the set still happened");
+        assert!(ppu.nmi_pending(), "the NMI edge still fired");
+
+        // The read landing one PPU clock before the set (position
+        // (241,1) — the set dot ticks inside the read's own cycle)
+        // swallows the set entirely: the flag never appears and no
+        // NMI edge fires (2.vbl_timing rule 8).
+        let mut ppu = ppu_ntsc_chr_ram(Mirroring::Vertical);
+        ppu.write_ctrl(0x80);
+        while ppu.position() != (241, 1) {
+            ppu.tick();
+        }
+        let value = ppu.read_status(0);
+        assert_eq!(value & 0x80, 0x00, "the flag is not set yet");
+        while ppu.position() != (241, 8) {
+            ppu.tick();
+        }
         assert!(!ppu.vblank, "the set was swallowed by the read");
         assert!(!ppu.nmi_pending());
     }
