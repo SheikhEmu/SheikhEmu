@@ -9,7 +9,8 @@ not to replace a general-purpose assembler.
 Syntax:
     label:              bind a label at the current address
     .org $C000          set the assembly address
-    .db $01, $02, "AB"  emit bytes (numbers or ASCII strings)
+    .equ NAME, $10      bind a constant symbol (no address advance)
+    .db $01, $02, "AB"  emit bytes (numbers, symbols or ASCII strings)
     .dw nmi, reset, irq emit 16-bit little-endian words (labels allowed)
     .fill 128, $FF      emit `count` copies of `value` (default $00)
     lda #$10            immediate
@@ -339,6 +340,25 @@ class SourceFile:
                 if self.base is None:
                     self.base = address
                 continue
+            if line.mnemonic == ".equ":
+                # A constant symbol: NAME, VALUE (no address advance).
+                parts = split_db_values(line.operand)
+                if len(parts) != 2:
+                    raise AsmError(
+                        f"line {line.number}: .equ needs NAME, VALUE")
+                name = parts[0].strip()
+                if not re.match(r"^[A-Za-z_][A-Za-z0-9_]*$", name):
+                    raise AsmError(
+                        f"line {line.number}: bad .equ name: {name}")
+                value = parse_number(parts[1])
+                if value is None or not -32768 <= value <= 65535:
+                    raise AsmError(
+                        f"line {line.number}: bad .equ value: {parts[1]}")
+                if name in self.labels:
+                    raise AsmError(
+                        f"line {line.number}: duplicate symbol: {name}")
+                self.labels[name] = value
+                continue
             if line.mnemonic == ".db":
                 address += sum(len(string_bytes(tok)) if tok.startswith('"')
                                else 1 for tok in split_db_values(line.operand))
@@ -407,12 +427,15 @@ class SourceFile:
             if line.mnemonic == ".org":
                 address = self._require_number(line)
                 continue
+            if line.mnemonic == ".equ":
+                # Constants were bound in pass 1; nothing to emit.
+                continue
             if line.mnemonic == ".db":
                 for token in split_db_values(line.operand or ""):
                     if token.startswith('"'):
                         data = string_bytes(token)
                     else:
-                        data = bytes([value_bytes(token)])
+                        data = bytes([resolve_value(token, self.labels) & 0xFF])
                     self._emit(image, address, data)
                     address += len(data)
                 continue
@@ -540,6 +563,19 @@ def selftest() -> None:
         ".org $C000\nloop: inc $10\nbne loop\nbeq loop\n")
     _expect_eq(image, b"\xe6\x10\xd0\xfc\xf0\xfa",
                "branch offsets with labels")
+
+    # .equ constants resolve in operands and .db (no address advance).
+    _, image, _ = assemble_text(
+        ".org $C000\n.equ STATUS, $80\nlda #STATUS\n.db STATUS, $01\n")
+    _expect_eq(image, b"\xa9\x80\x80\x01", ".equ in operand and .db")
+
+    # Duplicate symbols across .equ and labels are rejected.
+    try:
+        assemble_text(".org $C000\n.equ dup, 1\ndup: nop")
+    except AsmError:
+        pass
+    else:
+        raise AssertionError(".equ/label name clash not detected")
 
     # .dw with labels resolves to addresses, little endian (2 words = 4 bytes).
     _, image, _ = assemble_text(

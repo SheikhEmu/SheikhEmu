@@ -31,8 +31,12 @@ enum CommandError {
     Parse(RomError),
     /// The cartridge mapper is not one M1 can execute.
     UnsupportedMapper(u16),
-    /// The PRG image is not an NROM size (16/32 KiB).
+    /// The PRG image is not a valid size for the board.
     BadPrgSize(usize),
+    /// The CHR image is not a valid size for the board.
+    BadChrSize(usize),
+    /// The submapper combination is refused.
+    UnsupportedSubmapper(u16, u8),
     /// A command argument is missing or malformed.
     BadArgument(String),
     /// The CPU halted (JAM opcode) during the run.
@@ -56,11 +60,19 @@ impl std::fmt::Display for CommandError {
             CommandError::Parse(err) => write!(f, "{err}"),
             CommandError::UnsupportedMapper(mapper) => write!(
                 f,
-                "اللوحة رقم {mapper} غير مدعومة بعد — المدعوم حاليًا: NROM (0) وMMC1 الأدنى (1، لوحة بوابة M2)؛ إطار اللوحات الكامل يصل في M3/M5"
+                "اللوحة رقم {mapper} غير مدعومة بعد — المدعوم حاليًا: طاقم T1 (NROM 0 وUxROM 2 وCNROM 3 وAxROM 7 وColorDreams 11 وBNROM 34 وGxROM 66 وCamerica 71 وJ87 87/101) وMMC1 الأدنى (1، لوحة بوابة M2)؛ باقي العائلات تصل في M5"
             ),
             CommandError::BadPrgSize(size) => write!(
                 f,
-                "حجم PRG ({size} بايت) ليس من أحجام NROM (16 أو 32 كيلوبايت) — لا نخمّن تخطيطًا غير موثّق"
+                "حجم PRG ({size} بايت) ليس حجمًا صالحًا لهذه اللوحة — لا نخمّن تخطيطًا غير موثّق"
+            ),
+            CommandError::BadChrSize(size) => write!(
+                f,
+                "حجم CHR ({size} بايت) ليس حجمًا صالحًا لهذه اللوحة — لا نخمّن تخطيطًا غير موثّق"
+            ),
+            CommandError::UnsupportedSubmapper(mapper, submapper) => write!(
+                f,
+                "اللوحة {mapper} بالمصرف الفرعي {submapper} مرفوضة صراحة (NINA-001/002 تصل مع عائلات اللوحات في M5) — رسالة موثّقة لا شاشة سوداء"
             ),
             CommandError::BadArgument(message) => write!(f, "وسيط غير صالح: {message}"),
             CommandError::Halted { cycles, instructions } => write!(
@@ -96,6 +108,10 @@ impl From<se_core::bus::BusError> for CommandError {
             se_core::bus::BusError::UnsupportedMapper(mapper) => {
                 CommandError::UnsupportedMapper(mapper)
             }
+            se_core::bus::BusError::UnsupportedSubmapper(mapper, submapper) => {
+                CommandError::UnsupportedSubmapper(mapper, submapper)
+            }
+            se_core::bus::BusError::BadChrSize(size) => CommandError::BadChrSize(size),
         }
     }
 }
@@ -375,10 +391,10 @@ fn run_command(path: &str, flags: &[String]) -> Result<String, CommandError> {
     let options = RunOptions::parse(flags)?;
     let data = fs::read(path).map_err(|_| CommandError::FileUnreadable)?;
     let rom = parse(&data)?;
-    // Mapper 0 (NROM) runs fully; mapper 1 runs through the minimal
-    // MMC1 of D-22 (the M2 gate ROM's board). Anything else waits for
-    // the mapper framework in M3/M5.
-    if !matches!(rom.mapper, 0 | 1) {
+    // The M3 mapper set: the T1 family plus the minimal MMC1 (the
+    // M2 gate board, D-22). Anything else waits for M5 and gets the
+    // explicit Arabic refusal — never a silent run.
+    if !matches!(rom.mapper, 0 | 1 | 2 | 3 | 7 | 11 | 34 | 66 | 71 | 87 | 101) {
         return Err(CommandError::UnsupportedMapper(rom.mapper));
     }
     let region = region_of(&rom);
@@ -398,7 +414,15 @@ fn run_command(path: &str, flags: &[String]) -> Result<String, CommandError> {
         Mirroring::FourScreen => CoreMirroring::FourScreen,
     };
     let prg_ram = rom.battery || rom.prg_ram.is_some_and(|bytes| bytes > 0) || rom.mapper == 1;
-    let mut machine = Machine::from_rom(rom.prg, rom.mapper, chr, mirroring, prg_ram, region)?;
+    let mut machine = Machine::from_rom(
+        rom.prg,
+        rom.mapper,
+        rom.submapper,
+        chr,
+        mirroring,
+        prg_ram,
+        region,
+    )?;
 
     // Test-ROM automation entry (nestest convention) or a real reset.
     match options.start_pc {
@@ -869,10 +893,10 @@ mod tests {
 
     #[test]
     fn run_rejects_unimplemented_mappers_with_arabic_error() {
-        // Byte 6 high nibble carries the low mapper nibble: 0x20 =
-        // mapper 2 (UNROM) — unsupported until the M3 mapper frame.
+        // Byte 6 high nibble carries the low mapper nibble: 0x40 =
+        // mapper 4 (MMC3 territory, M5).
         let mut v = vec![
-            b'N', b'E', b'S', 0x1A, 1, 1, 0x20, 0x00, 0, 0, 0, 0, 0, 0, 0, 0,
+            b'N', b'E', b'S', 0x1A, 1, 1, 0x40, 0x00, 0, 0, 0, 0, 0, 0, 0, 0,
         ];
         v.extend(vec![0xEA; 16 * 1024]);
         v.extend(vec![0x00; 8 * 1024]);
@@ -882,8 +906,27 @@ mod tests {
         let err = run_command(path.to_str().expect("utf8"), &flags).expect_err("mapper");
         fs::remove_file(&path).ok();
         let text = err.to_string();
-        assert!(text.contains("اللوحة رقم 2"));
-        assert!(text.contains("NROM"));
+        assert!(text.contains("اللوحة رقم 4"));
+        assert!(text.contains("T1"));
+    }
+
+    #[test]
+    fn run_rejects_invalid_board_sizes_with_arabic_error() {
+        // Mapper 2 (UxROM) with a 16 KiB image: the Registry refuses
+        // the undocumented size instead of guessing a layout.
+        let mut v = vec![
+            b'N', b'E', b'S', 0x1A, 1, 1, 0x20, 0x00, 0, 0, 0, 0, 0, 0, 0, 0,
+        ];
+        v.extend(vec![0xEA; 16 * 1024]);
+        v.extend(vec![0x00; 8 * 1024]);
+        let path = temp_path("mapper-size");
+        fs::write(&path, v).expect("write ROM");
+        let flags = ["--frames".to_string(), "1".to_string()];
+        let err = run_command(path.to_str().expect("utf8"), &flags).expect_err("size");
+        fs::remove_file(&path).ok();
+        let text = err.to_string();
+        assert!(text.contains("حجم PRG"));
+        assert!(text.contains("لا نخمّن"));
     }
 
     #[test]

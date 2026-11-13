@@ -3,9 +3,11 @@
 # Everything runs offline and locally; no network, no accounts.
 
 PYTHON ?= python3
+DOLLAR := $$
 
 ASM := tools/asm/mini_asm.py
 MKROM := tools/mkrom.py
+MKBT := tools/mkbanktest.py
 
 ROM_BUILD := tests/roms/build
 HELLO_BIN := $(ROM_BUILD)/hello.bin
@@ -15,7 +17,17 @@ PATTERN_NES := tests/roms/pattern.nes
 PATTERN2_BIN := $(ROM_BUILD)/pattern2.bin
 PATTERN2_NES := tests/roms/pattern2.nes
 
-.PHONY: default test-roms gates fmt clippy test size golden ci-local clean help
+# The M3 board-verification ROMs (one per T1 family, §6.3 evidence).
+BT_SRC := tests/roms/src
+BT_OUT := $(ROM_BUILD)
+BT_CHR := $(BT_OUT)/banktest_chr4.bin
+BOARD_NES := tests/roms/banktest_uxrom.nes tests/roms/banktest_camerica.nes \
+  tests/roms/banktest_axrom.nes tests/roms/banktest_bnrom.nes \
+  tests/roms/banktest_colordreams.nes tests/roms/banktest_gxrom.nes \
+  tests/roms/banktest_cnrom.nes tests/roms/banktest_j87.nes \
+  tests/roms/banktest_m101.nes
+
+.PHONY: default test-roms boards gates fmt clippy test size golden ci-local clean help
 
 default: help
 
@@ -59,6 +71,53 @@ $(PATTERN2_NES): $(PATTERN2_BIN) tools/mkrom.py
 test-roms: $(HELLO_NES) $(PATTERN_NES) $(PATTERN2_NES)
 	$(PYTHON) $(ASM) --selftest
 
+# One engine + one CHR image serve the bank tests; every board gets its
+# own PRG layout (engine-last for the fixed-bank boards, engine-first
+# for the whole-window boards).
+$(BT_CHR): tools/mkbanktest.py | $(ROM_BUILD)
+	$(PYTHON) $(MKBT) build-chr --banks 4 --sig-lo '$(DOLLAR)C0' --sig-hi '$(DOLLAR)C4' --output $@
+
+$(BT_OUT)/%_engine.bin: $(BT_SRC)/banktest_%.asm tools/asm/mini_asm.py | $(ROM_BUILD)
+	$(PYTHON) $(ASM) --selftest
+	$(PYTHON) $(ASM) $< -o $@ --sym $@.sym
+
+tests/roms/banktest_uxrom.nes: $(BT_OUT)/uxrom_engine.bin tools/mkbanktest.py tools/mkrom.py
+	$(PYTHON) $(MKBT) build-prg --engine $< --layout fixed --banks 4 --unit '$(DOLLAR)4000' --sig-lo '$(DOLLAR)B0' --sig-hi '$(DOLLAR)B4' --output $(BT_OUT)/uxrom_prg.bin
+	$(PYTHON) $(MKROM) make --prg $(BT_OUT)/uxrom_prg.bin --mapper 2 --mirroring v --nes2 --prg-ram-kib 8 --chr-ram-kib 8 --output $@
+
+tests/roms/banktest_camerica.nes: $(BT_OUT)/camerica_engine.bin tools/mkbanktest.py tools/mkrom.py
+	$(PYTHON) $(MKBT) build-prg --engine $< --layout fixed --banks 4 --unit '$(DOLLAR)4000' --sig-lo '$(DOLLAR)B0' --sig-hi '$(DOLLAR)B4' --output $(BT_OUT)/camerica_prg.bin
+	$(PYTHON) $(MKROM) make --prg $(BT_OUT)/camerica_prg.bin --mapper 71 --mirroring v --nes2 --prg-ram-kib 8 --chr-ram-kib 8 --output $@
+
+tests/roms/banktest_axrom.nes: $(BT_OUT)/axrom_engine.bin tools/mkbanktest.py tools/mkrom.py
+	$(PYTHON) $(MKBT) build-prg --engine $< --layout linear --banks 4 --unit '$(DOLLAR)8000' --sig-lo '$(DOLLAR)B0' --sig-hi '$(DOLLAR)B4' --output $(BT_OUT)/axrom_prg.bin
+	$(PYTHON) $(MKROM) make --prg $(BT_OUT)/axrom_prg.bin --mapper 7 --nes2 --prg-ram-kib 8 --chr-ram-kib 8 --output $@
+
+tests/roms/banktest_bnrom.nes: $(BT_OUT)/bnrom_engine.bin tools/mkbanktest.py tools/mkrom.py
+	$(PYTHON) $(MKBT) build-prg --engine $< --layout linear --banks 4 --unit '$(DOLLAR)8000' --sig-lo '$(DOLLAR)B0' --sig-hi '$(DOLLAR)B4' --output $(BT_OUT)/bnrom_prg.bin
+	$(PYTHON) $(MKROM) make --prg $(BT_OUT)/bnrom_prg.bin --mapper 34 --nes2 --prg-ram-kib 8 --chr-ram-kib 8 --output $@
+
+tests/roms/banktest_colordreams.nes: $(BT_OUT)/colordreams_engine.bin $(BT_CHR) tools/mkbanktest.py tools/mkrom.py
+	$(PYTHON) $(MKBT) build-prg --engine $(BT_OUT)/colordreams_engine.bin --layout linear --banks 2 --unit '$(DOLLAR)8000' --sig-lo '$(DOLLAR)B0' --sig-hi '$(DOLLAR)B4' --output $(BT_OUT)/colordreams_prg.bin
+	$(PYTHON) $(MKROM) make --prg $(BT_OUT)/colordreams_prg.bin --chr $(BT_CHR) --mapper 11 --mirroring v --nes2 --prg-ram-kib 8 --output $@
+
+tests/roms/banktest_gxrom.nes: $(BT_OUT)/gxrom_engine.bin $(BT_CHR) tools/mkbanktest.py tools/mkrom.py
+	$(PYTHON) $(MKBT) build-prg --engine $(BT_OUT)/gxrom_engine.bin --layout linear --banks 2 --unit '$(DOLLAR)8000' --sig-lo '$(DOLLAR)B0' --sig-hi '$(DOLLAR)B4' --output $(BT_OUT)/gxrom_prg.bin
+	$(PYTHON) $(MKROM) make --prg $(BT_OUT)/gxrom_prg.bin --chr $(BT_CHR) --mapper 66 --mirroring v --nes2 --prg-ram-kib 8 --output $@
+
+tests/roms/banktest_cnrom.nes: $(BT_OUT)/cnrom_engine.bin $(BT_CHR) tools/mkrom.py
+	$(PYTHON) $(MKROM) make --prg $(BT_OUT)/cnrom_engine.bin --chr $(BT_CHR) --mapper 3 --mirroring v --nes2 --prg-ram-kib 8 --output $@
+
+tests/roms/banktest_j87.nes: $(BT_OUT)/j87_engine.bin $(BT_CHR) tools/mkrom.py
+	$(PYTHON) $(MKROM) make --prg $(BT_OUT)/j87_engine.bin --chr $(BT_CHR) --mapper 87 --mirroring v --nes2 --prg-ram-kib 8 --output $@
+
+tests/roms/banktest_m101.nes: $(BT_OUT)/m101_engine.bin $(BT_CHR) tools/mkrom.py
+	$(PYTHON) $(MKROM) make --prg $(BT_OUT)/m101_engine.bin --chr $(BT_CHR) --mapper 101 --mirroring v --nes2 --prg-ram-kib 8 --output $@
+
+boards: $(BOARD_NES)
+	$(PYTHON) $(ASM) --selftest
+	tools/check_boards.sh
+
 gates:
 	tools/provenance_check.sh && tools/cost_check.sh && tools/check_files.sh
 
@@ -78,7 +137,7 @@ golden:
 	tools/check_golden.sh
 	tools/check_pattern.sh
 
-ci-local: fmt clippy test test-roms gates size golden
+ci-local: fmt clippy test test-roms boards gates size golden
 
 clean:
 	rm -rf $(ROM_BUILD) $(HELLO_NES)

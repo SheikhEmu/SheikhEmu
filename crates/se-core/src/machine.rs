@@ -65,20 +65,21 @@ impl Machine {
         prg_ram: bool,
         region: Region,
     ) -> Result<Self, BusError> {
-        Self::from_rom(prg, 0, chr, mirroring, prg_ram, region)
+        Self::from_rom(prg, 0, 0, chr, mirroring, prg_ram, region)
     }
 
-    /// Build a machine for a mapper id (0 = NROM, 1 = the minimal
-    /// MMC1 of D-22).
+    /// Build a machine for a mapper id and submapper (the T1 set of
+    /// M3 plus the minimal MMC1 of D-22).
     pub fn from_rom(
         prg: Vec<u8>,
         mapper: u16,
+        submapper: u8,
         chr: Chr,
         mirroring: Mirroring,
         prg_ram: bool,
         region: Region,
     ) -> Result<Self, BusError> {
-        let bus = NesBus::with_mapper(prg, mapper, chr, mirroring, prg_ram, region)?;
+        let bus = NesBus::with_mapper(prg, mapper, submapper, chr, mirroring, prg_ram, region)?;
         Ok(Machine {
             cpu: Cpu::new(),
             bus,

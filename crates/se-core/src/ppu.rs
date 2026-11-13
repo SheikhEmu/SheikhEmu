@@ -69,6 +69,24 @@ impl Chr {
         }
     }
 
+    /// Byte at a PPU CHR address through an 8 KiB bank window
+    /// (CHR-ROM banking of the T1 boards; CHR RAM ignores the
+    /// window because RAM boards never bank it).
+    pub fn read_windowed(&self, addr: u16, window: usize) -> u8 {
+        let addr = addr & 0x1FFF;
+        match self {
+            Chr::Rom(rom) => {
+                let banks = rom.len() / 0x2000;
+                if banks == 0 {
+                    return 0;
+                }
+                let bank = (window / 0x2000) % banks;
+                rom[bank * 0x2000 + usize::from(addr)]
+            }
+            Chr::Ram(ram) => ram[usize::from(addr)],
+        }
+    }
+
     /// Write a byte; CHR ROM ignores writes, CHR RAM accepts them.
     pub fn write(&mut self, addr: u16, value: u8) {
         if let Chr::Ram(ram) = self {
@@ -158,6 +176,8 @@ pub struct Ppu {
     palette: [u8; 0x20],
     oam: [u8; 256],
     chr: Chr,
+    /// CHR-ROM bank window (byte offset; the mapper's 8 KiB window).
+    chr_window: usize,
 
     // ---- timing ----------------------------------------------------------
     scanline: u16,
@@ -273,6 +293,7 @@ impl Ppu {
             palette: [0; 0x20],
             oam: [0; 256],
             chr,
+            chr_window: 0,
             scanline: 0,
             dot: 0,
             frame: 0,
@@ -538,8 +559,8 @@ impl Ppu {
                         (tile, ctrl_sprite_table(self.ctrl))
                     };
                     let addr = table | (u16::from(base) << 4) | u16::from(row_eff & 0x07);
-                    let lo = self.chr.read(addr);
-                    let hi = self.chr.read(addr | 0x0008);
+                    let lo = self.chr.read_windowed(addr, self.chr_window);
+                    let hi = self.chr.read_windowed(addr | 0x0008, self.chr_window);
                     let slot = &mut self.next_sprites[usize::from(count)];
                     slot.is_sprite_zero = oam == 0;
                     slot.attr = attr;
@@ -678,8 +699,8 @@ impl Ppu {
 
         // Pattern bits.
         let addr = ctrl_bg_table(self.ctrl) | ((tile as u16) << 4) | fine_y as u16;
-        let lo = self.chr.read(addr);
-        let hi = self.chr.read(addr | 0x0008);
+        let lo = self.chr.read_windowed(addr, self.chr_window);
+        let hi = self.chr.read_windowed(addr | 0x0008, self.chr_window);
         let index = ((u32::from((hi >> bit) & 1) << 1) | u32::from((lo >> bit) & 1)) as u8;
         (index, palette)
     }
@@ -863,10 +884,16 @@ impl Ppu {
     // ---- memory ------------------------------------------------------------
 
     /// Read VRAM through the mirroring at a PPU address.
+    ///
+    /// `$3000-$3EFF` mirrors `$2000-$2EFF`; the CHR span `$0000-$1FFF`
+    /// keeps its full 13 bits — masking with `$2FFF` here used to fold
+    /// `$1000-$1FFF` onto `$0000-$0FFF` through `$2007` (the M3 bank
+    /// tests caught the M2-era bug).
     fn vram_read(&self, addr: u16) -> u8 {
-        let addr = addr & 0x2FFF; // $3000-$3EFF mirrors $2000-$2EFF
+        let addr = addr & 0x3FFF;
+        let addr = if addr >= 0x3000 { addr & 0x2EFF } else { addr };
         if addr < 0x2000 {
-            self.chr.read(addr)
+            self.chr.read_windowed(addr, self.chr_window)
         } else {
             let index = self.vram_index(addr);
             self.vram[index]
@@ -968,6 +995,11 @@ impl Ppu {
         self.chr.ram_bytes()
     }
 
+    /// The current nametable arrangement (the mapper sync compares).
+    pub fn mirroring(&self) -> Mirroring {
+        self.mirroring
+    }
+
     /// Change the nametable mirroring (MMC1's dynamic screen mode).
     ///
     /// The VRAM is resized between the 2 KiB and 4 KiB layouts; the
@@ -983,6 +1015,19 @@ impl Ppu {
             self.vram.resize(wanted, 0);
         }
         self.mirroring = mirroring;
+    }
+
+    /// Point the PPU's 8 KiB CHR window at a bank (CHR-ROM banking
+    /// boards of T1). CHR RAM ignores the call; CHR ROM wraps the
+    /// bank modulo the image's bank count (deterministic guard).
+    pub fn set_chr_bank(&mut self, bank: usize) {
+        self.chr_window = bank * 0x2000;
+        if let Chr::Rom(rom) = &self.chr {
+            let banks = rom.len() / 0x2000;
+            if banks > 0 {
+                self.chr_window = (bank % banks) * 0x2000;
+            }
+        }
     }
 
     // ---- output ---------------------------------------------------------------

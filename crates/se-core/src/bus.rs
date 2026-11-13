@@ -35,6 +35,7 @@
 
 use crate::cpu::Bus;
 use crate::input::Controllers;
+use crate::mapper::{CartSpec, Cartridge, MapperError, Registry};
 use crate::ppu::{Chr, Mirroring, Ppu};
 use crate::timing::Region;
 
@@ -44,218 +45,63 @@ pub const RAM_BYTES: usize = 2048;
 /// PRG RAM size in bytes (8 KiB at `$6000-$7FFF`).
 pub const PRG_RAM_BYTES: usize = 8192;
 
-/// PRG mapping of an NROM (mapper 0) cartridge.
-#[derive(Clone, Debug, PartialEq, Eq)]
-pub enum NromPrg {
-    /// 16 KiB PRG mirrored at `$8000` and `$C000` (NROM-128).
-    Mirror16k(Vec<u8>),
-    /// 32 KiB PRG mapped linearly at `$8000` (NROM-256).
-    Full32k(Vec<u8>),
-}
-
-impl NromPrg {
-    /// Build an NROM mapping from a PRG image.
-    ///
-    /// Only the two documented NROM sizes are accepted; other sizes are
-    /// rejected because guessing a mapping would be inventing hardware.
-    pub fn new(prg: Vec<u8>) -> Result<Self, BusError> {
-        const PRG_16K: usize = 16 * 1024;
-        const PRG_32K: usize = 32 * 1024;
-        match prg.len() {
-            PRG_16K => Ok(NromPrg::Mirror16k(prg)),
-            PRG_32K => Ok(NromPrg::Full32k(prg)),
-            other => Err(BusError::UnsupportedPrgSize(other)),
-        }
-    }
-
-    /// Read PRG ROM at a CPU address in `$8000-$FFFF`.
-    fn read(&self, addr: u16) -> u8 {
-        match self {
-            NromPrg::Mirror16k(prg) => prg[usize::from(addr & 0x3FFF)],
-            NromPrg::Full32k(prg) => prg[usize::from(addr & 0x7FFF)],
-        }
-    }
-}
-
-/// PRG mapping of the cartridge. Mapper 0 is the fixed NROM layout;
-/// the minimal mapper-1 (MMC1) PRG banking exists because the
-/// official M2 exit-gate ROM (`ppu_vbl_nmi`) is an MMC1 board —
-/// documented in DECISIONS.md (D-22); the full mapper framework and
-/// its verification matrix remain the M5 scope.
-#[derive(Clone, Debug)]
-enum Prg {
-    /// NROM: fixed 16 KiB mirrored or 32 KiB linear.
-    Nrom(NromPrg),
-    /// MMC1: 16 KiB bank units with the serial control registers.
-    Mmc1(Mmc1),
-}
-
-impl Prg {
-    /// Read a PRG byte at a CPU address in `$8000-$FFFF`.
-    fn read(&self, addr: u16) -> u8 {
-        match self {
-            Prg::Nrom(nrom) => nrom.read(addr),
-            Prg::Mmc1(mmc1) => mmc1.read(addr),
-        }
-    }
-
-    /// CPU write into `$8000-$FFFF`: NROM ignores it, MMC1 feeds its
-    /// serial registers.
-    fn write(&mut self, addr: u16, value: u8) {
-        if let Prg::Mmc1(mmc1) = self {
-            mmc1.write(addr, value);
-        }
-    }
-
-    /// Mapper state for the determinism hash.
-    fn state(&self) -> (u8, u8, u8, u8) {
-        match self {
-            Prg::Nrom(_) => (0, 0, 0, 0),
-            Prg::Mmc1(m) => (m.control, m.prg_bank, m.shift, m.bits),
-        }
-    }
-}
-
-/// The minimal MMC1 (mapper 1) implementation: the serial 5-bit
-/// register protocol, the four screen modes and the PRG banking
-/// modes, over a 16 KiB-banked image. CHR banking is not implemented
-/// because the gate cartridge ships CHR RAM (8 KiB), which the bank
-/// bits cannot move (documented limitation, D-22).
-#[derive(Clone, Debug)]
-struct Mmc1 {
-    image: Vec<u8>,
-    /// Register 0: screen mode bits 0-1, PRG mode bits 2-3.
-    control: u8,
-    /// The 5-bit serial shift accumulator and its bit counter.
-    shift: u8,
-    bits: u8,
-    /// Register 3: the PRG bank select.
-    prg_bank: u8,
-}
-
-impl Mmc1 {
-    /// Build from an image whose length is a multiple of 16 KiB.
-    fn new(image: Vec<u8>) -> Result<Self, BusError> {
-        if image.is_empty() || !image.len().is_multiple_of(0x4000) {
-            return Err(BusError::UnsupportedPrgSize(image.len()));
-        }
-        Ok(Mmc1 {
-            image,
-            // Power-up state: PRG mode 3 (switch $8000 / fixed
-            // $C000), screen mode 3.
-            control: 0x0C,
-            shift: 0,
-            bits: 0,
-            prg_bank: 0,
-        })
-    }
-
-    fn banks(&self) -> usize {
-        self.image.len() / 0x4000
-    }
-
-    /// The 16 KiB bank serving `$8000-$BFFF`.
-    fn low_bank(&self) -> usize {
-        let bank = usize::from(self.prg_bank & 0x0F);
-        match (self.control >> 2) & 3 {
-            0 => bank & !1, // 32 KiB switch: pair start.
-            1 => 0,         // fixed first bank.
-            _ => bank,      // 2/3: switchable low half.
-        }
-    }
-
-    /// The 16 KiB bank serving `$C000-$FFFF`.
-    fn high_bank(&self) -> usize {
-        let bank = usize::from(self.prg_bank & 0x0F);
-        let last = self.banks() - 1;
-        match (self.control >> 2) & 3 {
-            0 => (bank & !1) + 1, // 32 KiB switch: pair second.
-            1 => bank,            // switchable high half.
-            _ => last,            // 2/3: fixed last bank.
-        }
-    }
-
-    fn read(&self, addr: u16) -> u8 {
-        let bank = if addr < 0xC000 {
-            self.low_bank()
-        } else {
-            self.high_bank()
-        };
-        self.image[bank * 0x4000 + usize::from(addr & 0x3FFF)]
-    }
-
-    /// Feed one CPU write of the serial protocol.
-    ///
-    /// A write with bit 7 set resets the shifter (keeping the
-    /// current registers); otherwise the low bit accumulates, and
-    /// every fifth write latches into the register the address bits
-    /// 13-14 select.
-    fn write(&mut self, addr: u16, value: u8) {
-        if value & 0x80 != 0 {
-            self.shift = 0;
-            self.bits = 0;
-            // The documented reset side effect: PRG mode back to 3.
-            self.control = (self.control & 0x0F) | 0x0C;
-            return;
-        }
-        self.shift |= (value & 1) << self.bits;
-        self.bits += 1;
-        if self.bits == 5 {
-            let reg = (addr >> 13) & 3;
-            let latched = self.shift;
-            self.shift = 0;
-            self.bits = 0;
-            match reg {
-                0 => self.control = latched & 0x0F,
-                3 => self.prg_bank = latched & 0x0F,
-                _ => {} // CHR bank registers: no effect with 8 KiB RAM.
-            }
-        }
-    }
-
-    /// The screen mode the control register selects.
-    fn mirroring(&self) -> Mirroring {
-        match self.control & 3 {
-            0 => Mirroring::OneScreenA,
-            1 => Mirroring::OneScreenB,
-            2 => Mirroring::Vertical,
-            _ => Mirroring::Horizontal,
-        }
-    }
-}
-
 /// Failures while constructing a bus.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum BusError {
-    /// PRG image size is not a supported NROM size (in bytes).
+    /// PRG image size is not valid for the board (in bytes).
     UnsupportedPrgSize(usize),
     /// The mapper id has no implementation yet.
     UnsupportedMapper(u16),
+    /// The submapper combination is refused.
+    UnsupportedSubmapper(u16, u8),
+    /// CHR image size is not valid for the board.
+    BadChrSize(usize),
+}
+
+impl From<MapperError> for BusError {
+    fn from(err: MapperError) -> Self {
+        match err {
+            MapperError::Unsupported(mapper) => BusError::UnsupportedMapper(mapper),
+            MapperError::UnsupportedSubmapper(mapper, submapper) => {
+                BusError::UnsupportedSubmapper(mapper, submapper)
+            }
+            MapperError::BadPrgSize(size) => BusError::UnsupportedPrgSize(size),
+            MapperError::BadChrSize(size) => BusError::BadChrSize(size),
+        }
+    }
 }
 
 impl std::fmt::Display for BusError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
-            BusError::UnsupportedPrgSize(size) => write!(
-                f,
-                "PRG size {size} bytes is not an NROM size (16 or 32 KiB)"
-            ),
+            BusError::UnsupportedPrgSize(size) => {
+                write!(f, "PRG size {size} bytes is not valid for this board")
+            }
             BusError::UnsupportedMapper(mapper) => write!(
                 f,
-                "mapper {mapper} is not implemented (0 = NROM, 1 = the minimal MMC1)"
+                "mapper {mapper} is not implemented (T1 set: 0,2,3,7,11,34,66,71,87,101 \
+                 plus the minimal MMC1 1)"
             ),
+            BusError::UnsupportedSubmapper(mapper, submapper) => write!(
+                f,
+                "mapper {mapper} submapper {submapper} is refused (34/1 = NINA-001/002 \
+                 waits for the mapper families milestone)"
+            ),
+            BusError::BadChrSize(size) => {
+                write!(f, "CHR size {size} bytes is not valid for this board")
+            }
         }
     }
 }
 
 impl std::error::Error for BusError {}
 
-/// The M2 CPU bus: RAM + NROM/MMC1 PRG + optional PRG RAM + the real
-/// PPU.
+/// The M3 CPU bus: RAM + the cartridge (T1 mapper framework) +
+/// optional PRG RAM + the real PPU and controllers.
 #[derive(Clone, Debug)]
 pub struct NesBus {
     ram: [u8; RAM_BYTES],
-    prg: Prg,
+    cart: Cartridge,
     prg_ram: Option<Box<[u8; PRG_RAM_BYTES]>>,
     ppu: Ppu,
     region: Region,
@@ -279,6 +125,7 @@ impl NesBus {
         Self::with_mapper(
             prg,
             0,
+            0,
             Chr::Ram(Box::new([0; 0x2000])),
             Mirroring::Vertical,
             false,
@@ -294,30 +141,43 @@ impl NesBus {
         prg_ram: bool,
         region: Region,
     ) -> Result<Self, BusError> {
-        Self::with_mapper(prg, 0, chr, mirroring, prg_ram, region)
+        Self::with_mapper(prg, 0, 0, chr, mirroring, prg_ram, region)
     }
 
-    /// Build a bus for a mapper (0 = NROM, 1 = the minimal MMC1 of
-    /// D-22). The initial nametable mirroring comes from the header;
-    /// MMC1 owns it dynamically afterwards.
+    /// Build a bus for a mapper and submapper (the T1 set of M3 plus
+    /// the minimal MMC1 of D-22; the Registry validates and refuses
+    /// the rest). The initial nametable mirroring comes from the
+    /// header; boards that own mirroring (MMC1, AxROM, Camerica)
+    /// re-apply it on their register writes — AxROM applies its
+    /// power-on single-screen page immediately.
     pub fn with_mapper(
         prg: Vec<u8>,
         mapper: u16,
+        submapper: u8,
         chr: Chr,
         mirroring: Mirroring,
         prg_ram: bool,
         region: Region,
     ) -> Result<Self, BusError> {
-        let prg = match mapper {
-            0 => Prg::Nrom(NromPrg::new(prg)?),
-            1 => Prg::Mmc1(Mmc1::new(prg)?),
-            other => return Err(BusError::UnsupportedMapper(other)),
+        let chr_for_ppu = chr.clone();
+        let cart = Registry::build(CartSpec {
+            mapper,
+            submapper,
+            prg,
+            chr,
+            mirroring,
+        })?;
+        let power_mirroring = match cart.mapper() {
+            7 => cart.mirroring(),
+            _ => mirroring,
         };
+        let mut ppu = Ppu::new(region, chr_for_ppu, power_mirroring);
+        ppu.set_chr_bank(cart.chr_bank());
         Ok(NesBus {
             ram: [0; RAM_BYTES],
-            prg,
+            cart,
             prg_ram: prg_ram.then(|| Box::new([0u8; PRG_RAM_BYTES])),
-            ppu: Ppu::new(region, chr, mirroring),
+            ppu,
             region,
             latch: 0,
             cycles: 0,
@@ -401,7 +261,7 @@ impl NesBus {
                 Some(ram) => ram[usize::from(addr & 0x1FFF)],
                 None => self.latch,
             },
-            0x8000..=0xFFFF => self.prg.read(addr),
+            0x8000..=0xFFFF => self.cart.prg_read(addr),
             _ => self.latch,
         }
     }
@@ -424,7 +284,27 @@ impl NesBus {
 
     /// Mapper register state for the determinism hash.
     pub fn mapper_state(&self) -> (u8, u8, u8, u8) {
-        self.prg.state()
+        self.cart.state()
+    }
+
+    /// The board identity (reports).
+    pub fn board_name(&self) -> &'static str {
+        self.cart.board_name()
+    }
+
+    /// The mapper number.
+    pub fn mapper(&self) -> u16 {
+        self.cart.mapper()
+    }
+
+    /// Apply the cartridge's dynamic mirroring / CHR window to the
+    /// PPU after a register write (cheap and idempotent).
+    fn sync_cartridge_effects(&mut self) {
+        let mirroring = self.cart.mirroring();
+        if self.ppu.mirroring() != mirroring {
+            self.ppu.set_mirroring(mirroring);
+        }
+        self.ppu.set_chr_bank(self.cart.chr_bank());
     }
 
     /// Service a read against the devices (no clocking).
@@ -448,7 +328,7 @@ impl NesBus {
                 Some(ram) => ram[usize::from(addr & 0x1FFF)],
                 None => self.latch,
             },
-            0x8000..=0xFFFF => self.prg.read(addr),
+            0x8000..=0xFFFF => self.cart.prg_read(addr),
             _ => self.latch,
         }
     }
@@ -485,15 +365,17 @@ impl NesBus {
                 if let Some(ram) = self.prg_ram.as_deref_mut() {
                     ram[usize::from(addr & 0x1FFF)] = value;
                 }
+                // The J87 family (mappers 87/101) listens on
+                // $6000-$7FFF itself; every other board's register
+                // range starts at $8000 and the call is a no-op.
+                self.cart.cpu_write(addr, value);
+                self.sync_cartridge_effects();
             }
             0x8000..=0xFFFF => {
-                // Mapper writes: NROM ignores them, MMC1 latches its
-                // serial registers and owns the screen mode.
-                self.prg.write(addr, value);
-                if let Prg::Mmc1(mmc1) = &self.prg {
-                    let mirroring = mmc1.mirroring();
-                    self.ppu.set_mirroring(mirroring);
-                }
+                // Mapper register writes (the Cartridge filters the
+                // per-board address ranges itself).
+                self.cart.cpu_write(addr, value);
+                self.sync_cartridge_effects();
             }
             _ => {
                 // Unmapped writes are dropped.
@@ -734,5 +616,51 @@ mod tests {
             assert_eq!(bus.read(0x4017) & 1, 0, "port 2 slot {slot}");
         }
         assert_eq!(bus.read(0x4017) & 1, 1, "port 2 Right pressed");
+    }
+}
+
+#[cfg(test)]
+mod chr_window_tests {
+    use super::*;
+
+    /// A 32 KiB PRG image plus a 4-bank CHR ROM with signatures at the
+    /// bank starts/ends (the CNROM test shape).
+    fn chr4() -> Chr {
+        let mut rom = vec![0u8; 4 * 0x2000];
+        for bank in 0..4 {
+            rom[bank * 0x2000] = 0xC0 | bank as u8;
+            rom[bank * 0x2000 + 0x1FFF] = 0xC4 | bank as u8;
+        }
+        Chr::Rom(rom)
+    }
+
+    #[test]
+    fn cnrom_chr_window_reads_through_2007() {
+        let mut bus = NesBus::with_mapper(
+            vec![0xEA; 32 * 1024],
+            3,
+            0,
+            chr4(),
+            Mirroring::Vertical,
+            false,
+            Region::Ntsc,
+        )
+        .expect("cnrom");
+        // Bank 0 through the window at $0000 and $1FFF.
+        bus.write(0x8000, 0x00);
+        bus.write(0x2006, 0x00);
+        bus.write(0x2006, 0x00);
+        let _ = bus.read(0x2007); // discard the buffered read
+        assert_eq!(bus.read(0x2007), 0xC0, "bank 0 window start");
+        bus.write(0x2006, 0x1F);
+        bus.write(0x2006, 0xFF);
+        let _ = bus.read(0x2007);
+        assert_eq!(bus.read(0x2007), 0xC4, "bank 0 window end");
+        // Bank 3.
+        bus.write(0x8000, 0x03);
+        bus.write(0x2006, 0x00);
+        bus.write(0x2006, 0x00);
+        let _ = bus.read(0x2007);
+        assert_eq!(bus.read(0x2007), 0xC3, "bank 3 window start");
     }
 }

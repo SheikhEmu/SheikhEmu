@@ -45,6 +45,8 @@ jobs:
         run: cargo build --release -p se-cli
       - name: Test ROMs
         run: make test-roms
+      - name: Board verification ROMs
+        run: make boards
       - name: Provenance gate
         run: tools/provenance_check.sh
       - name: Cost gate
