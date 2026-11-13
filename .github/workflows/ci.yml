@@ -47,6 +47,8 @@ jobs:
         run: make test-roms
       - name: Board verification ROMs
         run: make boards
+      - name: Brick playability gate (M3.4, D-28)
+        run: make brick
       - name: Provenance gate
         run: tools/provenance_check.sh
       - name: Cost gate

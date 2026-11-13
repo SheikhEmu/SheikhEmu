@@ -1,0 +1,7 @@
+# SHEIKHEMU BRICK - the M3.4 game-over scenario (D-28 adaptation).
+# Start pressed once, then LEFT held from frame 200: the paddle walks
+# away from the serve line mid-flight, every serve is missed, the
+# three lives run out, and the game ends in the GAME OVER screen.
+30 start
+32
+200 left

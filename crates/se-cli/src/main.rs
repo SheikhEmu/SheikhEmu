@@ -45,6 +45,10 @@ enum CommandError {
     TraceUnwritable,
     /// The frame dump PNG could not be written.
     FrameUnwritable,
+    /// The RAM dump file could not be written.
+    RamUnwritable,
+    /// The video frame directory could not be written.
+    VideoUnwritable,
     /// The input script file could not be opened.
     ScriptUnreadable,
     /// The input script could not be parsed (Arabic reason).
@@ -84,6 +88,12 @@ impl std::fmt::Display for CommandError {
             }
             CommandError::FrameUnwritable => {
                 write!(f, "تعذر كتابة ملف صورة الإطار — تحقق من المسار والصلاحيات")
+            }
+            CommandError::RamUnwritable => {
+                write!(f, "تعذر كتابة ملف تفريغ الذاكرة — تحقق من المسار والصلاحيات")
+            }
+            CommandError::VideoUnwritable => {
+                write!(f, "تعذر كتابة إطارات الفيديو — تحقق من المجلد والصلاحيات")
             }
             CommandError::ScriptUnreadable => {
                 write!(f, "تعذر فتح ملف سيناريو الإدخال — تحقق من المسار")
@@ -180,7 +190,7 @@ fn print_usage() {
     println!("  se-cli info <ملف.nes>   تقرير تفصيلي عن الكارتريدج");
     println!("  se-cli run <ملف.nes> --frames N [--hash] [--trace-cpu <ملف>]");
     println!("        [--instructions N] [--start-pc <عنوان-ست-عشري>] [--dump-frame <ملف.png>]");
-    println!("        [--dump-plane <ملف>] [--input-script <ملف>]");
+    println!("        [--dump-plane <ملف>] [--input-script <ملف>] [--dump-ram <ملف>] [--dump-video <مجلد>]");
     println!("  se-cli script-help    صيغة ملف سيناريو الإدخال");
     println!("  se-cli -h | --help      هذه المساعدة");
 }
@@ -281,6 +291,14 @@ struct RunOptions {
     start_pc: Option<u16>,
     dump_frame: Option<String>,
     dump_plane: Option<String>,
+    /// `--dump-ram`: write RAM ($0000-$07FF) then cartridge WRAM
+    /// ($6000-$7FFF) to a file at the end of the run (the M3 game
+    /// gate reads its telemetry cells out of WRAM).
+    dump_ram: Option<String>,
+    /// `--dump-video <dir>`: write every completed frame as a PPM
+    /// image into the directory (the M3 owner-review video source).
+    /// The directory must already exist.
+    dump_video: Option<String>,
     input_script: Option<String>,
 }
 
@@ -295,6 +313,8 @@ impl RunOptions {
             start_pc: None,
             dump_frame: None,
             dump_plane: None,
+            dump_ram: None,
+            dump_video: None,
             input_script: None,
         };
         let mut i = 0;
@@ -353,6 +373,20 @@ impl RunOptions {
                         CommandError::BadArgument("--dump-plane يحتاج مسار ملف".to_string())
                     })?;
                     options.dump_plane = Some(value.clone());
+                    i += 2;
+                }
+                "--dump-ram" => {
+                    let value = flags.get(i + 1).ok_or_else(|| {
+                        CommandError::BadArgument("--dump-ram يحتاج مسار ملف".to_string())
+                    })?;
+                    options.dump_ram = Some(value.clone());
+                    i += 2;
+                }
+                "--dump-video" => {
+                    let value = flags.get(i + 1).ok_or_else(|| {
+                        CommandError::BadArgument("--dump-video يحتاج مسار مجلد".to_string())
+                    })?;
+                    options.dump_video = Some(value.clone());
                     i += 2;
                 }
                 "--input-script" => {
@@ -454,6 +488,8 @@ fn run_command(path: &str, flags: &[String]) -> Result<String, CommandError> {
     };
 
     let mut halted = None;
+    // The `--dump-video` frame counter (reported after the run).
+    let mut video_written = 0u32;
     let trace_one = |machine: &Machine, writer: &mut Option<BufWriter<fs::File>>| {
         if let Some(w) = writer {
             let line = format_trace_line(machine);
@@ -475,6 +511,9 @@ fn run_command(path: &str, flags: &[String]) -> Result<String, CommandError> {
             // Real PPU frames: each iteration runs to the next frame
             // completion so a trace stays readable frame by frame.
             // The input scenario advances at frame boundaries.
+            let video = options.dump_video.as_deref().map(std::path::PathBuf::from);
+            let mut picture: Option<Box<[u8; 256 * 240 * 3]>> =
+                video.as_ref().map(|_| Box::new([0; 256 * 240 * 3]));
             let mut script_cursor = 0usize;
             let mut buttons = 0u8;
             for frame_index in 0..frames {
@@ -494,6 +533,15 @@ fn run_command(path: &str, flags: &[String]) -> Result<String, CommandError> {
                         halted = Some((machine.cycle(), machine.instructions));
                         break;
                     }
+                }
+                if let (Some(dir), Some(picture)) = (&video, picture.as_mut()) {
+                    machine.ppu().last_frame_rgb(picture);
+                    let path = dir.join(format!("f{:05}.ppm", frame_index));
+                    let mut data = Vec::with_capacity(15 + 256 * 240 * 3);
+                    data.extend_from_slice(b"P6\n256 240\n255\n");
+                    data.extend_from_slice(picture.as_slice());
+                    fs::write(path, data).map_err(|_| CommandError::VideoUnwritable)?;
+                    video_written += 1;
                 }
                 if halted.is_some() {
                     break;
@@ -525,6 +573,9 @@ fn run_command(path: &str, flags: &[String]) -> Result<String, CommandError> {
     };
     let mut report = String::new();
     report.push_str(&format!("تقرير التشغيل: {file_name}\n"));
+    if let Some(dir) = options.dump_video.as_deref() {
+        report.push_str(&format!("إطارات الفيديو: {video_written} إطارًا → {dir}\n"));
+    }
     report.push_str(&format!("المنطقة: {region_text}\n"));
     report.push_str(&format!("مدة التشغيل: {length_text}\n"));
     report.push_str(&format!("الإطارات المكتملة: {}\n", machine.ppu().frame()));
@@ -557,6 +608,18 @@ fn run_command(path: &str, flags: &[String]) -> Result<String, CommandError> {
         png::write_png(std::path::Path::new(file), rgb.as_slice(), 256, 240)
             .map_err(|_| CommandError::FrameUnwritable)?;
         report.push_str(&format!("صورة الإطار: {file}\n"));
+    }
+    if let Some(file) = options.dump_ram.as_deref() {
+        // RAM first (2 KiB), then cartridge WRAM when present (8 KiB
+        // or the board's size): the deterministic post-run snapshot.
+        let mut dump = Vec::with_capacity(0x800 + 0x2000);
+        dump.extend_from_slice(machine.bus.ram());
+        if let Some(wram) = machine.bus.prg_ram() {
+            dump.extend_from_slice(wram);
+        }
+        let bytes = dump.len();
+        fs::write(std::path::Path::new(file), &dump).map_err(|_| CommandError::RamUnwritable)?;
+        report.push_str(&format!("تفريغ الذاكرة: {file} ({bytes} بايت)\n"));
     }
     if let Some(file) = options.dump_plane.as_deref() {
         // The raw palette-index plane (256x240 bytes): the golden
@@ -815,6 +878,62 @@ mod tests {
         assert!(report.contains("المنطقة: NTSC"));
         assert!(report.contains("الدورات المنفّذة:"));
         assert!(report.contains("التعليمات المنفّذة:"));
+    }
+
+    #[test]
+    fn run_dump_ram_writes_ram_and_reports_it() {
+        let path = temp_path("dumpram");
+        fs::write(&path, nop_rom()).expect("write ROM");
+        let dump = temp_path("dumpram.bin");
+        let flags: [String; 4] = [
+            "--frames".to_string(),
+            "2".to_string(),
+            "--dump-ram".to_string(),
+            dump.to_str().expect("utf8").to_string(),
+        ];
+        let report = run_command(path.to_str().expect("utf8"), &flags).expect("runs");
+        let first = fs::read(&dump).expect("dump written");
+        // Same run again: the dump is byte-identical (determinism).
+        let again = run_command(path.to_str().expect("utf8"), &flags).expect("runs");
+        fs::remove_file(&path).ok();
+        let second = fs::read(&dump).expect("dump written again");
+        fs::remove_file(&dump).ok();
+        // NROM with no battery and no NES 2.0 PRG-RAM size: RAM only.
+        assert_eq!(first.len(), 0x800);
+        assert_eq!(first, second, "deterministic RAM dump");
+        assert_eq!(
+            report.lines().count(),
+            again.lines().count(),
+            "identical reports"
+        );
+        assert!(report.contains("تفريغ الذاكرة"));
+    }
+
+    #[test]
+    fn run_dump_video_writes_one_ppm_per_frame() {
+        let path = temp_path("vid");
+        fs::write(&path, nop_rom()).expect("write ROM");
+        let dir = std::env::temp_dir().join("se-cli-dump-video-test");
+        let _ = fs::remove_dir_all(&dir);
+        fs::create_dir_all(&dir).expect("create dir");
+        let flags: [String; 4] = [
+            "--frames".to_string(),
+            "3".to_string(),
+            "--dump-video".to_string(),
+            dir.to_str().expect("utf8").to_string(),
+        ];
+        let report = run_command(path.to_str().expect("utf8"), &flags).expect("runs");
+        fs::remove_file(&path).ok();
+        let names: Vec<_> = fs::read_dir(&dir)
+            .expect("dir readable")
+            .filter_map(|entry| entry.ok().map(|e| e.file_name()))
+            .collect();
+        assert_eq!(names.len(), 3, "one file per frame");
+        let first = fs::read(dir.join("f00000.ppm")).expect("frame 0");
+        assert_eq!(&first[..3], b"P6\n");
+        assert_eq!(first.len(), 15 + 256 * 240 * 3);
+        assert!(report.contains("إطارات الفيديو: 3"));
+        let _ = fs::remove_dir_all(&dir);
     }
 
     #[test]

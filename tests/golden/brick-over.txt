@@ -1,0 +1,7 @@
+# SheikhEmu golden: the SHEIKHEMU BRICK game-over scenario (M3.4, D-28).
+# se-cli run tests/roms/brick.nes --frames 1000
+#     --input-script tests/input/brick-over.txt --hash
+# The deterministic loss: left-held steering misses every serve.
+# Regenerate on purpose after engine or game changes (DECISIONS.md first).
+frames=1000
+hash=8fe60913cddcb68d

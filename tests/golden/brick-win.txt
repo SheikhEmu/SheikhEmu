@@ -1,0 +1,8 @@
+# SheikhEmu golden: the SHEIKHEMU BRICK win scenario (M3.4, D-28).
+# se-cli run tests/roms/brick.nes --frames 2100
+#     --input-script tests/input/brick-win.txt --hash
+# The full deterministic playthrough: attract start, cleanup, three
+# towers cleared through real bank switches, YOU WIN.
+# Regenerate on purpose after engine or game changes (DECISIONS.md first).
+frames=2100
+hash=e1da58312f933da8

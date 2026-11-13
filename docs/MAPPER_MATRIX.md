@@ -3,7 +3,20 @@
 > **قاعدة الإعلان (§6.2):** «ن لوحة موثّقة بدليل» حيث ن = صفوف
 > `verified` فقط. لا `verified` بلا دليل. المرجع السلوكي لكل لوحة
 > صفحتها العامة على nesdev Wiki (مؤرشفة عبر الأرشيف العام وفق D-07)
-> — لا تخمين. تاريخ آخر تحديث: 2026-11-13 (دفعة M3.2).
+> — لا تخمين. تاريخ آخر تحديث: 2026-11-13 (دفعتا M3.2 وM3.4).
+
+## لعبة M3 على UxROM (دليل البوابة §15 — M3.4)
+
+**SHEIKHEMU BRICK** (`tests/roms/src/brick.asm` + `tools/mkbrick.py` →
+`tests/roms/brick.nes`): لعبة كسر طوب أبراج كاملة — محرّك في
+البنك المثبت $C000، والمستويات الثلاث في بنوك قابلة للتحويل
+قرأَها المحرّك فعليًا عبر نافذة $8000 عند كل تقدّم مستوى (3
+كتابات بنك موثقة في قياس اللعبة). بوابة اللعب بقرار D-28:
+سيناريوان حتميان (نجاح كامل بـ3 أبراج / نفاد الأرواح) عبر
+`tools/check_brick.sh` في CI (`make brick`) مع بصمتين ذهبيتين
+(`tests/golden/brick-win.txt` و`brick-over.txt`) — والفيديو
+المسلّم للمالك (أرشيف الجلسة) من إطارات المحاكي نفسها.
+
 
 أعمدة الدليل: الروم + الأمر + المخرج (تاريخ التشغيل 2026-11-13
 لجميع الصفوف أدناه؛ الأوامر تعمل محليًا وتاريخية عبر
@@ -12,7 +25,7 @@
 | المعرف | اللوحة | التصنيف | الدليل | ملاحظات |
 |---|---|---|---|---|
 | 0 | NROM | **verified** | hello.nes وpattern.nes عبر بوابتَي `tools/check_golden.sh` و`tools/check_pattern.sh` (بصمة hello-600 `40e5e5b7fbd0e05b` وإطار pattern بايت-ببايت — من M2، وأعيد توكيدهما اليوم) | 16K مُرآة أو 32K خطي؛ التسجيلات لا تؤثر فيه |
-| 2 | UxROM (UNROM/UOROM) | **verified** | `tests/roms/banktest_uxrom.nes` + `se-cli run … --frames 60` → «حالة الاختبار: نجاح كامل (00) / UXROM OK» (بوابة `tools/check_boards.sh` في CI) | بنوك 16K عند $8000 مع تثبيت الأخيرة في $C000؛ الكتابة $8000-$FFFF؛ القناع بbits 2-0 (UNROM) / 3-0 (UOROM) = حسب حجم الصورة. تعارضات الناقل على اللوحات الأصلية **غير محاكاة في B1** (موثقة أدناه) — الألعاب تحتالها برمجيًا وفق الوثيقة نفسها. الفرعان 94/180 (UN1ROM/CC-unrom) = documented-unimplemented إلى T4 |
+| 2 | UxROM (UNROM/UOROM) | **verified** | `tests/roms/banktest_uxrom.nes` + `se-cli run … --frames 60` → «حالة الاختبار: نجاح كامل (00) / UXROM OK» (بوابة `tools/check_boards.sh` في CI) **+ لعبة M3 الكاملة SHEIKHEMU BRICK عليها: تحويل بنوك فعلي بين المستويات** (`tools/check_brick.sh` في CI وبصمتان ذهبيتان — القسم الخاص أدناه) | بنوك 16K عند $8000 مع تثبيت الأخيرة في $C000؛ الكتابة $8000-$FFFF؛ القناع بbits 2-0 (UNROM) / 3-0 (UOROM) = حسب حجم الصورة. تعارضات الناقل على اللوحات الأصلية **غير محاكاة في B1** (موثقة أدناه) — الألعاب تحتالها برمجيًا وفق الوثيقة نفسها. الفرعان 94/180 (UN1ROM/CC-unrom) = documented-unimplemented إلى T4 |
 | 3 | CNROM | **verified** | `tests/roms/banktest_cnrom.nes` + `se-cli run … --frames 60` → «CNROM OK» (نفس البوابة) + دليل خارجي فئة ب: `test_ppu_read_buffer` (بلوحة CNROM 32K CHR) يعمل الآن — راجع P-18 في PRECISION_BACKLOG | نافذة CHR 8K من بتات القيمة 0-1 (الامتداد oversize بقناع عدد البنوك)؛ PRG 32K ثابت؛ submapper 2 (تعارضات AND) و1 (بلا تعارضات) — غير محاكاة التعارضات في B1 |
 | 7 | AxROM | **verified** | `tests/roms/banktest_axrom.nes` + نفس البوابة → «AXROM OK» | بنوك 32K من بتات 0-2؛ بت 4 يختار صفحة CIRAM 1K للشاشة الواحدة (طبق واحد الشاشة عند الإقلاع)؛ CHR RAM 8K؛ AMROM/AOROM ذات تعارضات — غير محاكاة في B1 |
 | 11 | ColorDreams | **verified** | `tests/roms/banktest_colordreams.nes` + نفس البوابة → «COLORDREAMS OK» | بنك PRG 32K من بتات 0-1 وبنك CHR 8K من بتات 4-7 بتسجيل واحد؛ تعارضات ناقل (نعم وفق الصفحة) — غير محاكاة في B1 |

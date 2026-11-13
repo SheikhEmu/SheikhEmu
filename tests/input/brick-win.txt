@@ -1,0 +1,7 @@
+# SHEIKHEMU BRICK - the M3.4 win scenario (D-28 adaptation).
+# Start pressed once at frame 30 (released at 32); from then on the
+# centered serve + the auto-launch play the whole tower demo: the
+# ball clears each level tower bottom-up, the engine switches banks
+# 0->1->2 between levels, and the game ends in the YOU WIN screen.
+30 start
+32
