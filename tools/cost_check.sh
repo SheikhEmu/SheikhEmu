@@ -16,8 +16,20 @@ status=0
 
 echo "== cost gate =="
 
-# 1. No external crate dependencies (workspace = stdlib only).
+# 1. No external crate dependencies outside the D-27 whitelist.
+#
+#    D-27 (owner-approved 2026-11-13): the ONLY external crates of the
+#    whole project are `winit` and `softbuffer`, and they are allowed
+#    ONLY in crates/se-frontend. Every other crate stays stdlib-only,
+#    and even se-frontend may not declare anything else external.
+#    Path dependencies are internal and always allowed.
+frontend_whitelist="winit softbuffer"
+
 for manifest in crates/*/Cargo.toml; do
+  case "$manifest" in
+    crates/se-frontend/Cargo.toml) whitelist="$frontend_whitelist" ;;
+    *) whitelist="" ;;
+  esac
   section=""
   while IFS= read -r line || [ -n "$line" ]; do
     case "$line" in
@@ -29,8 +41,15 @@ for manifest in crates/*/Cargo.toml; do
           case "$trimmed" in
             *path=*) : ;; # internal workspace dependency: allowed
             *)
-              echo "FAIL: external dependency in $manifest: $line"
-              status=1
+              name=${trimmed%%=*}
+              allowed=0
+              for ok in $whitelist; do
+                [ "$name" = "$ok" ] && allowed=1
+              done
+              if [ "$allowed" -eq 0 ]; then
+                echo "FAIL: external dependency in $manifest: $line"
+                status=1
+              fi
               ;;
           esac
         fi

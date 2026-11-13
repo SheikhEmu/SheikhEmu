@@ -1,0 +1,22 @@
+[package]
+name = "se-frontend"
+description = "SheikhEmu minimal window frontend (M3.3)"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+publish.workspace = true
+
+[[bin]]
+name = "se-frontend"
+path = "src/main.rs"
+
+# D-27 (owner-approved 2026-11-13): winit and softbuffer are the only
+# two external crates of the whole project, allowed exclusively in
+# this crate (se-core / se-rom / se-cli stay zero-dependency). The
+# cost gate whitelists exactly these two names for exactly this
+# manifest; versions are locked in the committed Cargo.lock.
+[dependencies]
+se-core = { path = "../se-core", version = "0.1.0" }
+se-rom = { path = "../se-rom", version = "0.1.0" }
+softbuffer = "0.4"
+winit = "0.30"

@@ -1,6 +1,6 @@
 [workspace]
 resolver = "2"
-members = ["crates/se-core", "crates/se-rom", "crates/se-cli"]
+members = ["crates/se-core", "crates/se-rom", "crates/se-cli", "crates/se-frontend"]
 
 [workspace.package]
 version = "0.1.0"
@@ -10,5 +10,7 @@ edition = "2021"
 license = "MIT"
 publish = false
 
-# NOTE: no external dependencies by design (zero-cost / zero-network rule).
-# The Rust standard library is the only dependency of the entire workspace.
+# NOTE: se-core, se-rom and se-cli are zero-dependency by design
+# (stdlib only). The single sanctioned exception is D-27
+# (owner-approved 2026-11-13): se-frontend may use exactly winit and
+# softbuffer; the cost gate enforces the whitelist.
