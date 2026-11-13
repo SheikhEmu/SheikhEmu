@@ -65,6 +65,7 @@
 .equ CLEANPH, $28     ; field cleanup phase (3,2,1,0 = done)
 .equ ZPL,     $2B     ; RAM clear pointer (lo/hi)
 .equ ZPH,     $2C
+.equ QHEAD,   $2D     ; drain position inside the pending queue (D-31)
 
 ; ---- fixed addresses ------------------------------------------------------
 .equ PPUCTRL, $2000
@@ -173,6 +174,9 @@ wait2:
     bpl wait2
 
     ; ---- CHR RAM: tiles 0..7 at $0000, digits at $0100, letters $0200 --
+    ; D-31: every tile is a full 16-byte two-plane tile (the PPU
+    ; always decodes 16 bytes per tile; the old 8-byte "tiles" made
+    ; each glyph's plane 1 the next glyph's data -> on-screen garble).
     bit PPUSTAT
     lda #$00
     sta PPUADDR
@@ -180,9 +184,9 @@ wait2:
     sta PPUADDR
     ldx #$0C
     jsr load_src            ; slot offset 12: chr_tiles
-    lda #$40
+    lda #$80
     sta SCR3
-    jsr chr_bytes           ; 64 bytes
+    jsr chr_bytes           ; 128 bytes = 8 tiles x 16
 
     bit PPUSTAT
     lda #$01
@@ -191,9 +195,9 @@ wait2:
     sta PPUADDR
     ldx #$0E
     jsr load_src            ; slot offset 14: font_digits
-    lda #$50
+    lda #$A0
     sta SCR3
-    jsr chr_bytes           ; 80 bytes
+    jsr chr_bytes           ; 160 bytes = 10 digits x 16
 
     bit PPUSTAT
     lda #$02
@@ -202,9 +206,13 @@ wait2:
     sta PPUADDR
     ldx #$10
     jsr load_src            ; slot offset 16: font_letters
-    lda #$A0
+    lda #$00
     sta SCR3
-    jsr chr_bytes           ; 160 bytes
+    jsr chr_bytes           ; 256 bytes = letters 0..15 (D-31 two-plane)
+    inc SRCPH               ; the source pointer advances 256
+    lda #$40
+    sta SCR3
+    jsr chr_bytes           ; 64 more = letters 16..19, fills to $033F
 
     ; ---- the base nametable: ceiling row 2, walls in every row -------
     bit PPUSTAT
@@ -250,7 +258,11 @@ row_cols:
     cmp #$1E
     bne row_loop
 
-    ; attributes: brick rows (tile rows 4..9) use bg palette 1.
+    ; attributes: the brick band (tile rows 4..9, attribute bytes
+    ; 8..$17 covering tile rows 4..11) uses bg palette 1 for the
+    ; inner quadrants; the side-wall quadrants (cols 0..1 / 30..31)
+    ; stay palette 0 so the walls keep one gray ink top to bottom
+    ; (no red side-wall segments inside the brick band).
     bit PPUSTAT
     lda #$23
     sta PPUADDR
@@ -263,7 +275,18 @@ attr_loop:
     bcc attr_put
     cpx #$18
     bcs attr_put
-    lda #$55
+    txa
+    and #$07
+    beq attr_left            ; col-group 0: walls left, bricks right
+    cmp #$07
+    beq attr_right           ; col-group 7: bricks left, walls right
+    lda #$55                 ; middle col-groups: all palette 1
+    jmp attr_put
+attr_left:
+    lda #$44                 ; wall quadrants palette 0, brick quadrants palette 1
+    jmp attr_put
+attr_right:
+    lda #$11                 ; brick quadrants palette 1, wall quadrants palette 0
 attr_put:
     sta PPUDATA
     inx
@@ -271,6 +294,9 @@ attr_put:
     bne attr_loop
 
     ; ---- the attract palette -------------------------------------------
+    ; D-31: bg palette 0 color 1 is the walls/ceiling ink ($10 gray)
+    ; and color 3 the two-plane text ink ($30 white); the old $00
+    ; entries were black-on-black invisible.
     bit PPUSTAT
     lda #$3F
     sta PPUADDR
@@ -356,8 +382,15 @@ oam_put:
     bne oam_init
 
     ; rendering on: background + sprites, NMI on.
+    ; D-31: the canonical scroll reset after the boot VRAM writes -
+    ; $2000 (nametable latch into t) then two $2005 writes (0,0), so
+    ; the first frame renders from nametable 0 at scroll 0,0 instead
+    ; of wherever the last $2006 left the loopy t register.
     lda #$80
     sta PPUCTRL
+    lda #$00
+    sta $2005
+    sta $2005
     lda #$1E
     sta PPUMASK
 
@@ -434,30 +467,33 @@ init_game:
     sta WSTAT
     lda #$00
     sta TOUT
-    lda #$03                 ; the cleanup phase counter
+    lda #$04                 ; the cleanup phase counter (4 batches)
     sta CLEANPH
     lda #$01
     sta STATE
     sta DELAY
     jmp main_loop
 
-; The serve phase: first the field cleanup (attract leftovers, in
-; three fixed batches of rows), then the level load, then the actual
-; serve delay.
+; The serve phase: the field cleanup (attract/over/win leftovers)
+; and the level load, one bounded batch per frame and only once the
+; previous batch has fully drained (the queue is drained at most 32
+; entries per NMI - see nmi); then the actual serve delay.
 serve_step:
+    lda QLEN
+    bne serve_draining     ; last batch still in flight
     lda CLEANPH
     beq serve_ready
-    cmp #$03
-    bne sc2
+    cmp #$04
+    bne sc3_check2
     lda #$06                 ; row 6: title
     jsr clean_row
     lda #$08                 ; row 8: subtitle
     jsr clean_row
     dec CLEANPH
     rts
-sc2:
-    cmp #$02
-    bne sc1
+sc3_check2:
+    cmp #$03
+    bne sc2
     lda #$0C                 ; row 12: over-text / attract tower
     jsr clean_row
     lda #$0D
@@ -466,16 +502,27 @@ sc2:
     jsr clean_row
     dec CLEANPH
     rts
-sc1:
-    lda #$14                 ; row 20: press-start
+sc2:
+    cmp #$02
+    bne sc1a
+    lda #$14                 ; row 20: over/win press-start
     jsr clean_row
     lda #$16                 ; row 22
     jsr clean_row
+    dec CLEANPH
+    rts
+sc1a:
+    cmp #$01
+    bne sc1b
+    dec CLEANPH             ; fall through: this frame loads the level
+sc1b:
     lda #$00
     sta CLEANPH
     jsr load_level
     jsr status_level
     jsr wram_level_text
+    rts
+serve_draining:
     rts
 
 serve_ready:
@@ -1316,10 +1363,31 @@ nmi:
     lda #$02
     sta OAMDMA
 
+    ; D-31: the CAPPED drain. The OAM DMA alone costs 513 bus cycles
+    ; and each queue entry ~40, so a full 84-entry drain plus the DMA
+    ; would run ~3300 cycles - past the ~2273-cycle vblank, into the
+    ; pre-render line and past its v-reload, and every following
+    ; frame then rendered from whatever $2006 the drain tail left in
+    ; v (the frame-by-frame drift of the owner's videos). The NMI
+    ; now drains at most 32 entries (about 1900 cycles with the DMA)
+    ; and keeps the rest pending at QHEAD for the next frames.
+    lda QLEN
+    sec
+    sbc QHEAD             ; entries still pending
+    cmp #$20
+    bcc nmi_have
+    lda #$20
+nmi_have:
+    sta QOFF
+    beq nmi_drained
+    lda QHEAD
+    asl a                 ; 2*QHEAD
+    clc
+    adc QHEAD             ; 3*QHEAD (<= 252: no page crossing)
+    tax
     ldy #$00
-    ldx #$00
 nmi_drain:
-    cpy QLEN
+    cpy QOFF
     bcs nmi_drained
     lda QUEUE0,x
     sta PPUADDR
@@ -1333,8 +1401,29 @@ nmi_drain:
     iny
     jmp nmi_drain
 nmi_drained:
-    lda #$00
+    lda QHEAD
+    clc
+    adc QOFF
+    sta QHEAD
+    cmp QLEN
+    bcc nmi_keepq
+    lda #$00             ; fully drained: the queue is empty again
     sta QLEN
+    sta QHEAD
+nmi_keepq:
+
+    ; D-31: the canonical scroll reset after the frame's VRAM writes.
+    ; Every queue drain writes $2006/$2007, which leaves the loopy t
+    ; register pointing at the last written cell; without restoring
+    ; it here the picture drifted a little every frame. The reset is
+    ; the documented sequence: $2000 (nametable select) then two
+    ; $2005 writes (0,0) - applied AFTER the last PPU write of the
+    ; frame, so v reloads from a stable t at the pre-render line.
+    lda #$80
+    sta $2000
+    lda #$00
+    sta $2005
+    sta $2005
 
     lda #$01
     sta NMIFLAG
@@ -1389,58 +1478,103 @@ row_pat:
     .db $00,$00,$00,$00,$00,$00,$00,$00,$00,$00,$00,$00,$00,$00,$01,$01
 
 pal_attract:
-    .db $0F,$00,$10,$00        ; bg palette 0: field
+    ; D-31: the text ink is color 3; $28 is the white entry of this
+    ; emulator's calibrated 2C02 table (its $30 renders pink - the
+    ; table is a documented approximation; the ROM adapts, the core
+    ; table is untouched).
+    .db $0F,$10,$30,$28        ; bg palette 0: field, walls gray, text white (D-31)
     .db $0F,$16,$27,$16        ; bg palette 1: brick (red)
-    .db $0F,$00,$10,$00        ; bg palette 2
-    .db $0F,$00,$10,$00        ; bg palette 3
+    .db $0F,$10,$30,$28        ; bg palette 2
+    .db $0F,$10,$30,$28        ; bg palette 3
     .db $0F,$30,$21,$30        ; sprite palette 4: paddle
     .db $0F,$30,$16,$30        ; sprite palette 5: ball
     .db $0F,$30,$28,$30        ; sprite palette 6: lives
-    .db $0F,$00,$10,$00        ; sprite palette 7
+    .db $0F,$10,$30,$30        ; sprite palette 7
 
+; D-31: 16-byte two-plane tiles. Plane 1 is zero for the scene tiles
+; (single-plane ink = palette color 1); the life icon tile 7 carries
+; the same pattern in both planes like the text glyphs (color 3).
 chr_tiles:
-    .db $00,$00,$00,$00,$00,$00,$00,$00          ; 0 blank
-    .db $FF,$81,$81,$81,$81,$81,$81,$FF          ; 1 wall
-    .db $00,$FF,$C3,$C3,$C3,$C3,$C3,$FF          ; 2 brick (level 1)
-    .db $00,$FF,$AA,$55,$AA,$55,$AA,$FF          ; 3 brick (level 2)
-    .db $00,$FF,$66,$99,$66,$99,$66,$FF          ; 4 brick (level 3)
-    .db $00,$00,$FF,$FF,$FF,$FF,$00,$00          ; 5 paddle segment
-    .db $00,$3C,$7E,$7E,$7E,$7E,$3C,$00          ; 6 ball
-    .db $00,$00,$18,$18,$18,$00,$00,$00          ; 7 life icon
+    .db $00,$00,$00,$00,$00,$00,$00,$00          ; 0 blank (plane 0)
+    .db $00,$00,$00,$00,$00,$00,$00,$00          ; 0 blank (plane 1)
+    .db $FF,$81,$81,$81,$81,$81,$81,$FF          ; 1 wall (plane 0)
+    .db $00,$00,$00,$00,$00,$00,$00,$00          ; 1 wall (plane 1)
+    .db $00,$FF,$C3,$C3,$C3,$C3,$C3,$FF          ; 2 brick level 1 (plane 0)
+    .db $00,$00,$00,$00,$00,$00,$00,$00          ; 2 brick level 1 (plane 1)
+    .db $00,$FF,$AA,$55,$AA,$55,$AA,$FF          ; 3 brick level 2 (plane 0)
+    .db $00,$00,$00,$00,$00,$00,$00,$00          ; 3 brick level 2 (plane 1)
+    .db $00,$FF,$66,$99,$66,$99,$66,$FF          ; 4 brick level 3 (plane 0)
+    .db $00,$00,$00,$00,$00,$00,$00,$00          ; 4 brick level 3 (plane 1)
+    .db $00,$00,$FF,$FF,$FF,$FF,$00,$00          ; 5 paddle segment (plane 0)
+    .db $00,$00,$00,$00,$00,$00,$00,$00          ; 5 paddle segment (plane 1)
+    .db $00,$3C,$7E,$7E,$7E,$7E,$3C,$00          ; 6 ball (plane 0)
+    .db $00,$00,$00,$00,$00,$00,$00,$00          ; 6 ball (plane 1)
+    .db $00,$00,$18,$18,$18,$00,$00,$00          ; 7 life icon (plane 0)
+    .db $00,$00,$18,$18,$18,$00,$00,$00          ; 7 life icon (plane 1: color 3)
 
-font_digits:
-    .db $38, $44, $44, $44, $44, $44, $38, $00          ; '0'
-    .db $10, $30, $10, $10, $10, $10, $38, $00          ; '1'
-    .db $38, $44, $04, $08, $10, $20, $7C, $00          ; '2'
-    .db $38, $44, $04, $18, $04, $44, $38, $00          ; '3'
-    .db $08, $18, $28, $48, $7C, $08, $08, $00          ; '4'
-    .db $7C, $40, $78, $04, $04, $44, $38, $00          ; '5'
-    .db $38, $44, $40, $78, $44, $44, $38, $00          ; '6'
-    .db $7C, $04, $08, $10, $10, $10, $10, $00          ; '7'
-    .db $38, $44, $44, $38, $44, $44, $38, $00          ; '8'
-    .db $38, $44, $44, $3C, $04, $44, $38, $00          ; '9'
+font_digits:                  ; D-31: two-plane 16-byte tiles (ink = color 3)
+    .db $38, $44, $44, $44, $44, $44, $38, $00          ; '0' plane 0
+    .db $38, $44, $44, $44, $44, $44, $38, $00          ; '0' plane 1 (D-31: color 3)
+    .db $10, $30, $10, $10, $10, $10, $38, $00          ; '1' plane 0
+    .db $10, $30, $10, $10, $10, $10, $38, $00          ; '1' plane 1 (D-31: color 3)
+    .db $38, $44, $04, $08, $10, $20, $7C, $00          ; '2' plane 0
+    .db $38, $44, $04, $08, $10, $20, $7C, $00          ; '2' plane 1 (D-31: color 3)
+    .db $38, $44, $04, $18, $04, $44, $38, $00          ; '3' plane 0
+    .db $38, $44, $04, $18, $04, $44, $38, $00          ; '3' plane 1 (D-31: color 3)
+    .db $08, $18, $28, $48, $7C, $08, $08, $00          ; '4' plane 0
+    .db $08, $18, $28, $48, $7C, $08, $08, $00          ; '4' plane 1 (D-31: color 3)
+    .db $7C, $40, $78, $04, $04, $44, $38, $00          ; '5' plane 0
+    .db $7C, $40, $78, $04, $04, $44, $38, $00          ; '5' plane 1 (D-31: color 3)
+    .db $38, $44, $40, $78, $44, $44, $38, $00          ; '6' plane 0
+    .db $38, $44, $40, $78, $44, $44, $38, $00          ; '6' plane 1 (D-31: color 3)
+    .db $7C, $04, $08, $10, $10, $10, $10, $00          ; '7' plane 0
+    .db $7C, $04, $08, $10, $10, $10, $10, $00          ; '7' plane 1 (D-31: color 3)
+    .db $38, $44, $44, $38, $44, $44, $38, $00          ; '8' plane 0
+    .db $38, $44, $44, $38, $44, $44, $38, $00          ; '8' plane 1 (D-31: color 3)
+    .db $38, $44, $44, $3C, $04, $44, $38, $00          ; '9' plane 0
+    .db $38, $44, $44, $3C, $04, $44, $38, $00          ; '9' plane 1 (D-31: color 3)
 
-font_letters:
-    .db $38, $44, $44, $7C, $44, $44, $44, $00          ; 'A'
-    .db $78, $44, $44, $78, $44, $44, $78, $00          ; 'B'
-    .db $38, $44, $40, $40, $40, $44, $38, $00          ; 'C'
-    .db $7C, $40, $40, $78, $40, $40, $7C, $00          ; 'E'
-    .db $38, $44, $40, $4C, $44, $44, $38, $00          ; 'G'
-    .db $44, $44, $44, $7C, $44, $44, $44, $00          ; 'H'
-    .db $38, $10, $10, $10, $10, $10, $38, $00          ; 'I'
-    .db $44, $48, $50, $60, $50, $48, $44, $00          ; 'K'
-    .db $40, $40, $40, $40, $40, $40, $7C, $00          ; 'L'
-    .db $44, $6C, $54, $44, $44, $44, $44, $00          ; 'M'
-    .db $44, $64, $54, $54, $4C, $44, $44, $00          ; 'N'
-    .db $38, $44, $44, $44, $44, $44, $38, $00          ; 'O'
-    .db $78, $44, $44, $78, $40, $40, $40, $00          ; 'P'
-    .db $78, $44, $44, $78, $50, $48, $44, $00          ; 'R'
-    .db $3C, $40, $40, $38, $04, $04, $78, $00          ; 'S'
-    .db $7C, $10, $10, $10, $10, $10, $10, $00          ; 'T'
-    .db $44, $44, $44, $44, $44, $44, $38, $00          ; 'U'
-    .db $44, $44, $44, $44, $44, $28, $10, $00          ; 'V'
-    .db $44, $44, $44, $54, $54, $6C, $44, $00          ; 'W'
-    .db $44, $44, $44, $28, $10, $10, $10, $00          ; 'Y'
+font_letters:                 ; D-31: two-plane 16-byte tiles (ink = color 3)
+    .db $38, $44, $44, $7C, $44, $44, $44, $00          ; 'A' plane 0
+    .db $38, $44, $44, $7C, $44, $44, $44, $00          ; 'A' plane 1 (D-31: color 3)
+    .db $78, $44, $44, $78, $44, $44, $78, $00          ; 'B' plane 0
+    .db $78, $44, $44, $78, $44, $44, $78, $00          ; 'B' plane 1 (D-31: color 3)
+    .db $38, $44, $40, $40, $40, $44, $38, $00          ; 'C' plane 0
+    .db $38, $44, $40, $40, $40, $44, $38, $00          ; 'C' plane 1 (D-31: color 3)
+    .db $7C, $40, $40, $78, $40, $40, $7C, $00          ; 'E' plane 0
+    .db $7C, $40, $40, $78, $40, $40, $7C, $00          ; 'E' plane 1 (D-31: color 3)
+    .db $38, $44, $40, $4C, $44, $44, $38, $00          ; 'G' plane 0
+    .db $38, $44, $40, $4C, $44, $44, $38, $00          ; 'G' plane 1 (D-31: color 3)
+    .db $44, $44, $44, $7C, $44, $44, $44, $00          ; 'H' plane 0
+    .db $44, $44, $44, $7C, $44, $44, $44, $00          ; 'H' plane 1 (D-31: color 3)
+    .db $38, $10, $10, $10, $10, $10, $38, $00          ; 'I' plane 0
+    .db $38, $10, $10, $10, $10, $10, $38, $00          ; 'I' plane 1 (D-31: color 3)
+    .db $44, $48, $50, $60, $50, $48, $44, $00          ; 'K' plane 0
+    .db $44, $48, $50, $60, $50, $48, $44, $00          ; 'K' plane 1 (D-31: color 3)
+    .db $40, $40, $40, $40, $40, $40, $7C, $00          ; 'L' plane 0
+    .db $40, $40, $40, $40, $40, $40, $7C, $00          ; 'L' plane 1 (D-31: color 3)
+    .db $44, $6C, $54, $44, $44, $44, $44, $00          ; 'M' plane 0
+    .db $44, $6C, $54, $44, $44, $44, $44, $00          ; 'M' plane 1 (D-31: color 3)
+    .db $44, $64, $54, $54, $4C, $44, $44, $00          ; 'N' plane 0
+    .db $44, $64, $54, $54, $4C, $44, $44, $00          ; 'N' plane 1 (D-31: color 3)
+    .db $38, $44, $44, $44, $44, $44, $38, $00          ; 'O' plane 0
+    .db $38, $44, $44, $44, $44, $44, $38, $00          ; 'O' plane 1 (D-31: color 3)
+    .db $78, $44, $44, $78, $40, $40, $40, $00          ; 'P' plane 0
+    .db $78, $44, $44, $78, $40, $40, $40, $00          ; 'P' plane 1 (D-31: color 3)
+    .db $78, $44, $44, $78, $50, $48, $44, $00          ; 'R' plane 0
+    .db $78, $44, $44, $78, $50, $48, $44, $00          ; 'R' plane 1 (D-31: color 3)
+    .db $3C, $40, $40, $38, $04, $04, $78, $00          ; 'S' plane 0
+    .db $3C, $40, $40, $38, $04, $04, $78, $00          ; 'S' plane 1 (D-31: color 3)
+    .db $7C, $10, $10, $10, $10, $10, $10, $00          ; 'T' plane 0
+    .db $7C, $10, $10, $10, $10, $10, $10, $00          ; 'T' plane 1 (D-31: color 3)
+    .db $44, $44, $44, $44, $44, $44, $38, $00          ; 'U' plane 0
+    .db $44, $44, $44, $44, $44, $44, $38, $00          ; 'U' plane 1 (D-31: color 3)
+    .db $44, $44, $44, $44, $44, $28, $10, $00          ; 'V' plane 0
+    .db $44, $44, $44, $44, $44, $28, $10, $00          ; 'V' plane 1 (D-31: color 3)
+    .db $44, $44, $44, $54, $54, $6C, $44, $00          ; 'W' plane 0
+    .db $44, $44, $44, $54, $54, $6C, $44, $00          ; 'W' plane 1 (D-31: color 3)
+    .db $44, $44, $44, $28, $10, $10, $10, $00          ; 'Y' plane 0
+    .db $44, $44, $44, $28, $10, $10, $10, $00          ; 'Y' plane 1 (D-31: color 3)
 
 .org $FFFA
     .dw nmi, reset, irq

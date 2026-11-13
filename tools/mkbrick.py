@@ -13,6 +13,10 @@ Level bank layout (offsets inside the 16 KiB bank):
   $8054: 32 palette bytes ($3F00-$3F1F order)
   $8074: speed, points, brick tile, signature ($B0+bank)
 
+D-31: bg palette 0 must match the engine's attract palette - walls
+gray (color 1), two-plane text white (color 3); the old $00 entries
+were black-on-black invisible ink.
+
 Original content: the levels below are this project's own design.
 """
 import argparse
@@ -29,15 +33,17 @@ TOWER_COL = 7
 
 def palette(brick: int, brick_hi: int, brick_lo: int) -> bytes:
     """The 32 palette bytes for one level (bg + sprite palettes)."""
+    # D-31: bg 0 color 3 is the text ink - $28, the white entry of this
+    # emulator's calibrated 2C02 table (its $30 renders pink).
     return bytes([
-        0x0F, 0x00, 0x10, 0x00,        # bg 0: field / walls
+        0x0F, 0x10, 0x30, 0x28,        # bg 0: field, walls gray, text white (D-31)
         0x0F, brick, brick_hi, brick_lo,  # bg 1: the level's bricks
-        0x0F, 0x00, 0x10, 0x00,        # bg 2
-        0x0F, 0x00, 0x10, 0x00,        # bg 3
+        0x0F, 0x10, 0x30, 0x28,        # bg 2
+        0x0F, 0x10, 0x30, 0x28,        # bg 3
         0x0F, 0x30, 0x21, 0x30,        # sprite 4: paddle
         0x0F, 0x30, brick, 0x30,       # sprite 5: ball
         0x0F, 0x30, 0x28, 0x30,        # sprite 6: life icons
-        0x0F, 0x00, 0x10, 0x00,        # sprite 7
+        0x0F, 0x10, 0x30, 0x30,        # sprite 7
     ])
 
 

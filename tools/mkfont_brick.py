@@ -7,6 +7,14 @@ texts need. Emits `mini_asm` `.db` lines ready to paste into
 brick.asm (tile data lives in the ROM and is uploaded to CHR-RAM at
 boot through $2007, exactly like pattern.asm does).
 
+D-31: every glyph is emitted as a full two-plane 16-byte tile. The
+pattern is duplicated into plane 1 so text pixels are color 3 of the
+background palette (a bright ink), while one-plane tiles (walls,
+bricks) keep color 1. Before D-31 the glyphs were 8-byte single-plane
+"tiles": the PPU always decodes 16 bytes per tile, so each glyph's
+second plane was the next glyph's data - the on-screen garble the
+owner's videos exposed.
+
 Usage: python3 mkfont_brick.py            # print the .db lines
        python3 mkfont_brick.py --check    # verify 8 rows per glyph
 """
@@ -82,7 +90,8 @@ def main() -> None:
     for ch in FONT_ORDER:
         rows = ", ".join(f"${v:02X}" for v in glyph_rows(ch))
         comment = "space" if ch == " " else ch
-        print(f"    .db {rows}          ; '{comment}'")
+        print(f"    .db {rows}          ; '{comment}' plane 0")
+        print(f"    .db {rows}          ; '{comment}' plane 1 (D-31: color 3)")
 
 
 if __name__ == "__main__":
