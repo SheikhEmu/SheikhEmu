@@ -52,8 +52,9 @@ check() { # $1 = label, $2 = actual, $3 = expected
 }
 
 # ---- the WIN scenario ------------------------------------------------------
+vid=$(mktemp -d)
 report=$(target/release/se-cli run tests/roms/brick.nes --frames 2100 \
-    --input-script tests/input/brick-win.txt --hash --dump-ram "$dump")
+    --input-script tests/input/brick-win.txt --hash --dump-ram "$dump" --dump-video "$vid")
 printf '%s\n' "$report" | grep -q 'نص النتيجة: YOU WIN' \
   || { echo "FAIL: win scenario never reached YOU WIN"; status=1; }
 
@@ -70,7 +71,7 @@ check "win current bank (2)" "$(wbyte "$dump" 0x15)" "2"
 
 # ---- the OVER scenario -----------------------------------------------------
 report=$(target/release/se-cli run tests/roms/brick.nes --frames 1000 \
-    --input-script tests/input/brick-over.txt --hash --dump-ram "$dump")
+    --input-script tests/input/brick-over.txt --hash --dump-ram "$dump" --dump-video "$vid")
 printf '%s\n' "$report" | grep -q 'نص النتيجة: GAME OVER' \
   || { echo "FAIL: over scenario never reached GAME OVER"; status=1; }
 
@@ -81,7 +82,15 @@ check "over state hash" "$actual" "$expected"
 check "over outcome (1)" "$(wbyte "$dump" 0x12)" "1"
 check "over lives exhausted (0)" "$(wbyte "$dump" 0x11)" "0"
 
+# ---- the HUD row tile-map gate (D-35, the owner's evidence standard) ------
+# The final frame of each scenario, decoded as a tile map from the pixels:
+# the complete non-overlapping SCORE/LEVEL/LIVES line.
+python3 tools/hud_row_check.py "$vid/f02099.ppm" win || status=1
+python3 tools/hud_row_check.py "$vid/f00999.ppm" over || status=1
+python3 tools/hud_row_check.py "$vid/f00020.ppm" title || status=1
+
 rm -f "$dump"
+rm -rf "$vid"
 
 if [ "$status" -eq 0 ]; then
   echo "PASS: SHEIKHEMU BRICK played to both terminal states (D-28)"
