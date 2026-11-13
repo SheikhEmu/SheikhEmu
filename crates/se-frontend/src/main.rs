@@ -22,10 +22,18 @@
 //! Window systems differ; the CI never opens a window (it builds and
 //! runs the pure modules' tests headlessly). The window itself is
 //! verified by the owner locally — see PROGRESS.md.
+//!
+//! D-32 adds the **replay mode** (evidence tooling, not gameplay):
+//! `--input-script <file> --frames <N> --hold-secs <S>` replays a
+//! deterministic scenario at the CLI's own frame-boundary contract,
+//! holds the final frame for `S` seconds, and exits — so a known-state
+//! window screenshot can be compared pixel-by-pixel with the same-state
+//! CLI frame (the owner's display evidence standard).
 
 mod keys;
 mod pacing;
 mod scale;
+mod script;
 
 use std::num::NonZeroU32;
 use std::path::PathBuf;
@@ -72,6 +80,18 @@ struct Frontend {
     context: softbuffer::Context<OwnedDisplayHandle>,
     window: Option<Rc<Window>>,
     surface: Option<softbuffer::Surface<OwnedDisplayHandle, Rc<Window>>>,
+    /// The replay scenario (D-32): `None` = live keyboard play.
+    script: Option<script::InputScript>,
+    /// The parse position inside the replay schedule.
+    script_cursor: usize,
+    /// Replay stop condition: the number of frames to run.
+    frame_limit: Option<u32>,
+    /// Frames completed since startup (the replay clock).
+    frames_done: u32,
+    /// Replay hold: seconds to keep showing the final frame.
+    hold_secs: Option<f64>,
+    /// When set, the replay finished and this is the exit instant.
+    hold_deadline: Option<Instant>,
 }
 
 impl Frontend {
@@ -131,14 +151,35 @@ impl Frontend {
     }
 
     /// Run one emulated frame, refresh the staging picture, present.
+    /// In replay mode the scenario's snapshot lands before the frame
+    /// runs — the same frame-boundary contract as the CLI's input
+    /// script — and the live keyboard bitmap is ignored.
     fn run_one_frame(&mut self) -> Result<(), CpuError> {
-        // The input snapshot lands before the frame runs (the same
-        // frame-boundary contract as the CLI's input script).
-        self.machine.set_controller_buttons(0, self.buttons);
+        let buttons = match &self.script {
+            Some(script) => {
+                let mut cursor = self.script_cursor;
+                let snapshot = script.buttons_at(self.frames_done, &mut cursor);
+                self.script_cursor = cursor;
+                snapshot
+            }
+            None => self.buttons,
+        };
+        self.machine.set_controller_buttons(0, buttons);
         self.machine.run_frames(1)?;
         self.machine.ppu().last_frame_rgb(&mut self.picture);
+        self.frames_done += 1;
         self.present();
         Ok(())
+    }
+
+    /// Whether the replay finished all its frames (D-32): the final
+    /// picture stays presented for the hold window, then the loop
+    /// exits so a capture pipeline can grab the exact final frame.
+    fn replay_finished(&self) -> bool {
+        self.script.is_some()
+            && self
+                .frame_limit
+                .is_some_and(|limit| self.frames_done >= limit)
     }
 }
 
@@ -179,10 +220,15 @@ impl ApplicationHandler for Frontend {
                     },
                 ..
             } => {
-                if let Some(bit) = keys::key_to_bit(code) {
-                    match state {
-                        ElementState::Pressed => self.buttons |= bit,
-                        ElementState::Released => self.buttons &= !bit,
+                // Replay mode ignores the keyboard for injection (D-32):
+                // the scenario is the only input source; the window
+                // stays honest about what it is showing.
+                if self.script.is_none() {
+                    if let Some(bit) = keys::key_to_bit(code) {
+                        match state {
+                            ElementState::Pressed => self.buttons |= bit,
+                            ElementState::Released => self.buttons &= !bit,
+                        }
                     }
                 }
                 if code == KeyCode::Escape {
@@ -199,6 +245,23 @@ impl ApplicationHandler for Frontend {
     }
 
     fn about_to_wait(&mut self, event_loop: &ActiveEventLoop) {
+        // The replay hold: the final frame stays on screen until the
+        // hold deadline, then the loop exits (the capture pipeline's
+        // window of opportunity — D-32).
+        if let Some(deadline) = self.hold_deadline {
+            if Instant::now() >= deadline {
+                event_loop.exit();
+                return;
+            }
+            event_loop.set_control_flow(ControlFlow::WaitUntil(deadline));
+            return;
+        }
+        if self.replay_finished() {
+            let hold = Duration::from_secs_f64(self.hold_secs.unwrap_or(0.0));
+            self.hold_deadline = Some(Instant::now() + hold);
+            event_loop.set_control_flow(ControlFlow::WaitUntil(self.hold_deadline.unwrap()));
+            return;
+        }
         let now = Instant::now();
         if now >= self.deadline {
             if self.run_one_frame().is_err() {
@@ -222,15 +285,79 @@ impl ApplicationHandler for Frontend {
 fn main() {
     // The Arabic usage text (D-06: user-facing messages are Arabic).
     let args: Vec<String> = std::env::args().collect();
-    if args.len() != 2 {
+    if args.len() < 2 {
         eprintln!("محاكي SheikhEmu — الواجهة الدنيا للمرحلة M3");
         eprintln!(
-            "الاستخدام: {} <ملف الروم .nes>",
+            "الاستخدام: {} <ملف الروم .nes> [خيارات]",
             args.first().map(String::as_str).unwrap_or("se-frontend")
         );
+        eprintln!("الخيارات:");
+        eprintln!("  --input-script <ملف>   تشغيل سيناريو حتمي (وضع الدليل D-32)");
+        eprintln!("  --frames <عدد>         عدد إطارات التشغيل ثم التوقف");
+        eprintln!("  --hold-secs <ثوان>     مدة إبقاء الإطار الأخير قبل الخروج");
         std::process::exit(2);
     }
     let path = PathBuf::from(&args[1]);
+
+    // The replay options (D-32), parsed from argument 2 on. Every
+    // parse error is reported in Arabic with the offending value.
+    let mut script: Option<script::InputScript> = None;
+    let mut frame_limit: Option<u32> = None;
+    let mut hold_secs: Option<f64> = None;
+    let mut index = 2usize;
+    while index < args.len() {
+        let arg = args[index].as_str();
+        let value = args.get(index + 1).map(String::as_str);
+        let mut consumed = 2usize;
+        let outcome: Result<(), String> = match arg {
+            "--input-script" => match value {
+                Some(file) => match std::fs::read_to_string(file) {
+                    Ok(text) => match script::InputScript::parse(&text) {
+                        Ok(parsed) => {
+                            script = Some(parsed);
+                            Ok(())
+                        }
+                        Err(error) => Err(format!("سيناريو غير صالح: {error}")),
+                    },
+                    Err(_) => Err(format!("تعذّر قراءة ملف السيناريو: {file}")),
+                },
+                None => Err("--input-script يحتاج مسار ملف".to_string()),
+            },
+            "--frames" => match value {
+                Some(text) => match text.parse::<u32>() {
+                    Ok(frames) => {
+                        frame_limit = Some(frames);
+                        Ok(())
+                    }
+                    Err(_) => Err(format!("عدد إطارات غير صالح: {text}")),
+                },
+                None => Err("--frames يحتاج عددًا".to_string()),
+            },
+            "--hold-secs" => match value {
+                Some(text) => match text.parse::<f64>() {
+                    Ok(secs) => {
+                        hold_secs = Some(secs);
+                        Ok(())
+                    }
+                    Err(_) => Err(format!("مدة غير صالحة: {text}")),
+                },
+                None => Err("--hold-secs يحتاج عدد ثوان".to_string()),
+            },
+            other => {
+                consumed = 1;
+                Err(format!("خيار غير معروف: {other}"))
+            }
+        };
+        if let Err(error) = outcome {
+            eprintln!("{error}");
+            std::process::exit(2);
+        }
+        index += consumed;
+    }
+    if (frame_limit.is_some() || hold_secs.is_some()) && script.is_none() {
+        eprintln!("‏--frames و--hold-secs يعملان مع --input-script (وضع الدليل D-32)");
+        std::process::exit(2);
+    }
     let data = match std::fs::read(&path) {
         Ok(data) => data,
         Err(_) => {
@@ -310,6 +437,12 @@ fn main() {
         context,
         window: None,
         surface: None,
+        script,
+        script_cursor: 0,
+        frame_limit,
+        frames_done: 0,
+        hold_secs,
+        hold_deadline: None,
     };
     if let Err(error) = event_loop.run_app(&mut frontend) {
         eprintln!("أُغلقت حلقة الأحداث بخطأ: {error}");
