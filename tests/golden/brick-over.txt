@@ -4,4 +4,4 @@
 # The deterministic loss: left-held steering misses every serve.
 # Regenerate on purpose after engine or game changes (DECISIONS.md first).
 frames=1000
-hash=acffc6598fbde5f3
+hash=754237d89043122e

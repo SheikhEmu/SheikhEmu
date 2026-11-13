@@ -4,4 +4,4 @@
 # The full deterministic playthrough: attract start, cleanup, three towers cleared through real bank switches, YOU WIN.
 # Regenerate on purpose after engine or game changes (DECISIONS.md first).
 frames=2100
-hash=189a828826b3f975
+hash=832fabba38308554

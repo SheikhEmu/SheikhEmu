@@ -323,7 +323,7 @@ pal_boot:
     bit PPUSTAT
     lda #$21
     sta PPUADDR
-    lda #$0C                 ; row 8, col 12: BRICK
+    lda #$0C                 ; row 8, col 12: BREAKOUT
     sta PPUADDR
     ldx #$02
     jsr load_src            ; slot 1: txt_sub
@@ -332,34 +332,38 @@ pal_boot:
     bit PPUSTAT
     lda #$22
     sta PPUADDR
-    lda #$2A                 ; row 22, col 10: PRESS START
+    lda #$2A                 ; row 17, col 10: PRESS START
     sta PPUADDR
     ldx #$04
     jsr load_src            ; slot 2: txt_press
     jsr ppu_str
 
+    ; the attract tower: three stacked brick pairs at rows 12..14,
+    ; columns 16..17 - the exact cell the level towers grow from
+    ; (TOWER_COL 7 -> tile columns 16..17), so the title previews the
+    ; play itself (IMPROVE: clean transition, one shape language).
     bit PPUSTAT
     lda #$21
     sta PPUADDR
-    lda #$8E                 ; row 12, col 14
+    lda #$90                 ; row 12, col 16
     sta PPUADDR
     lda #$02
     sta PPUDATA
     lda #$02
     sta PPUDATA
     bit PPUSTAT
-    lda #$22
+    lda #$21
     sta PPUADDR
-    lda #$0E                 ; row 13, col 14
+    lda #$B0                 ; row 13, col 16
     sta PPUADDR
     lda #$02
     sta PPUDATA
     lda #$02
     sta PPUDATA
     bit PPUSTAT
-    lda #$22
+    lda #$21
     sta PPUADDR
-    lda #$8E                 ; row 14, col 14
+    lda #$D0                 ; row 14, col 16
     sta PPUADDR
     lda #$02
     sta PPUDATA
@@ -450,7 +454,10 @@ do_win:
 win_wait:
 
 main_done:
+    lda STATE
+    beq md_no_oam           ; attract: the game sprites stay hidden
     jsr shadow_oam
+md_no_oam:
     jsr wram_update
     jmp main_loop
 
@@ -505,9 +512,9 @@ sc3_check2:
 sc2:
     cmp #$02
     bne sc1a
-    lda #$14                 ; row 20: over/win press-start
+    lda #$11                 ; row 17: the attract PRESS START
     jsr clean_row
-    lda #$16                 ; row 22
+    lda #$14                 ; row 20: the over/win PRESS START
     jsr clean_row
     dec CLEANPH
     rts
@@ -1267,7 +1274,7 @@ ri_loop:
     rts
 
 ; ---------------------------------------------------------------------------
-; the OAM shadow: five paddle sprites, the ball, three life icons.
+; the OAM shadow: five paddle sprites, the ball (lives = HUD icons).
 shadow_oam:
     ldx #$00                 ; X = OAM byte offset (sprite i = X/4)
 so_pad:
@@ -1298,44 +1305,9 @@ so_pad:
     sta $0216
     lda BALLX
     sta $0217
-    ldx #$00
-so_liv:
-    cpx LIVES
-    bcc so_show
-    lda #$F0
-    jmp so_put
-so_show:
-    lda #$E6                  ; icon row y = 230
-so_put:
-    sta SCR3
-    txa
-    asl a
-    asl a
-    clc
-    adc #$18                 ; OAM offset 24 + i*4
-    tay
-    lda SCR3
-    sta $0200,y
-    lda #$07
-    sta $0201,y
-    lda #$02
-    sta $0202,y
-    txa
-    asl a
-    asl a
-    asl a                    ; i*8
-    sta SCR3
-    txa
-    asl a
-    asl a                    ; i*4
-    clc
-    adc SCR3                 ; i*12
-    clc
-    adc #$10                 ; x = 16 + i*12
-    sta $0203,y
-    inx
-    cpx #$03
-    bne so_liv
+    ; The lives are the row-0 HUD icons (IMPROVE: one place, one
+    ; language); the old duplicate sprite icons under the field are
+    ; gone - their OAM bytes stay at the boot $F0 (offscreen).
     rts
 
 ; ---------------------------------------------------------------------------
@@ -1462,7 +1434,7 @@ txt_ptrs:
     .dw txt_title, txt_sub, txt_press, txt_over, txt_win, txt_attract, chr_tiles, font_digits, font_letters
 
 txt_title:   .db "SHEIKHEMU", 0
-txt_sub:     .db "BRICK", 0
+txt_sub:     .db "BREAKOUT", 0
 txt_press:   .db "PRESS START", 0
 txt_over:    .db "GAME OVER", 0
 txt_win:     .db "YOU WIN", 0
