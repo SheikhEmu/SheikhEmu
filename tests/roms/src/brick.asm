@@ -370,6 +370,51 @@ pal_boot:
     lda #$02
     sta PPUDATA
 
+    ; ---- the HUD row (row 0): SCORE 0000 LEVEL 1 LIVES *** ------------
+    ; Labels at fixed columns, values at fixed columns, one full row
+    ; that never overlaps itself: SCORE cols 2-6, the four digits
+    ; cols 8-11 (MSB first), LEVEL cols 13-17, its digit col 19,
+    ; LIVES cols 21-25, the life icons cols 27-29. Every value update
+    ; writes only its own columns (status_score/status_level/
+    ; status_lives), so the row reads complete in every state: the
+    ; title, the play, both endings, after every level transition
+    ; and every life loss (the D-33 HUD fix).
+    bit PPUSTAT
+    lda #$20
+    sta PPUADDR
+    lda #$02                 ; row 0, column 2
+    sta PPUADDR
+    ldx #$12
+    jsr load_src             ; slot offset 18: txt_hscore
+    jsr ppu_str              ; SCORE -> cols 2..6, cursor at col 7
+    lda #$00
+    sta PPUDATA              ; col 7: gap
+    lda #$10                 ; '0'
+    sta PPUDATA              ; col 8
+    sta PPUDATA              ; col 9
+    sta PPUDATA              ; col 10
+    sta PPUDATA              ; col 11
+    lda #$00
+    sta PPUDATA              ; col 12: gap
+    ldx #$14
+    jsr load_src             ; slot offset 20: txt_hlevel
+    jsr ppu_str              ; LEVEL -> cols 13..17, cursor at col 18
+    lda #$00
+    sta PPUDATA              ; col 18: gap
+    lda #$11                 ; digit '1' (LEVEL = 0 at boot)
+    sta PPUDATA              ; col 19
+    lda #$00
+    sta PPUDATA              ; col 20: gap
+    ldx #$16
+    jsr load_src             ; slot offset 22: txt_hlives
+    jsr ppu_str              ; LIVES -> cols 21..25, cursor at col 26
+    lda #$00
+    sta PPUDATA              ; col 26: gap
+    lda #$07                 ; the life icon tile
+    sta PPUDATA              ; col 27
+    sta PPUDATA              ; col 28
+    sta PPUDATA              ; col 29
+
     ; ---- the OAM shadow -------------------------------------------------
     ldx #$00
 oam_init:
@@ -390,6 +435,7 @@ oam_put:
     ; $2000 (nametable latch into t) then two $2005 writes (0,0), so
     ; the first frame renders from nametable 0 at scroll 0,0 instead
     ; of wherever the last $2006 left the loopy t register.
+    lda PPUSTAT           ; clear the vblank flag before the PPUCTRL write
     lda #$80
     sta PPUCTRL
     lda #$00
@@ -408,6 +454,17 @@ main_loop:
     beq main_loop
     lda #$00
     sta NMIFLAG
+    ; The queue compaction (D-31): when the drain has caught up
+    ; (QHEAD == QLEN) the append index resets here, at the frame start
+    ; where no NMI can preempt this code - the queue stays single-
+    ; owner-per-variable at every instant.
+    lda QLEN
+    cmp QHEAD
+    bne ml_no_compact
+    lda #$00
+    sta QLEN
+    sta QHEAD
+ml_no_compact:
     jsr read_input
     lda STATE
     cmp #$01
@@ -476,6 +533,9 @@ init_game:
     sta TOUT
     lda #$04                 ; the cleanup phase counter (4 batches)
     sta CLEANPH
+    jsr digits_from_score   ; the score just zeroed: refresh 0000
+    jsr status_score
+    jsr status_level        ; the level digit and the lives icons
     lda #$01
     sta STATE
     sta DELAY
@@ -487,6 +547,7 @@ init_game:
 ; entries per NMI - see nmi); then the actual serve delay.
 serve_step:
     lda QLEN
+    cmp QHEAD
     bne serve_draining     ; last batch still in flight
     lda CLEANPH
     beq serve_ready
@@ -526,7 +587,6 @@ sc1b:
     lda #$00
     sta CLEANPH
     jsr load_level
-    jsr status_level
     jsr wram_level_text
     rts
 serve_draining:
@@ -655,6 +715,7 @@ chk_loss:
 
 life_lost:
     dec LIVES
+    jsr status_lives        ; the HUD icons follow the loss immediately
     lda LIVES
     beq game_over
     lda #$01
@@ -832,7 +893,11 @@ load_level:
     sta $8000                ; the UxROM bank register
     sta CURBANK
     inc BANKWR
-    ; clear the previous level's brick tiles first.
+    ; blank the previous level's brick tiles first (BTILE = 0 for
+    ; the clear pass; D-31: this was done in the wrong place before,
+    ; which zeroed BTILE for the draw pass too).
+    lda #$00
+    sta BTILE
     ldx #$00
 ll_clear:
     lda ALIVE,x
@@ -883,8 +948,6 @@ ll_pal:
     cpx #$20
     bne ll_pal
     ; draw this level's bricks (BTILE now holds the level tile).
-    lda #$00
-    sta BTILE
     ldx #$00
 ll_draw:
     lda ALIVE,x
@@ -895,17 +958,22 @@ ll_draw_next:
     cpx #$54
     bne ll_draw
     jsr recenter_ball
+    jsr status_level        ; the HUD level digit follows the switch
     rts
 
 ; queue the two tiles of brick cell X, using BTILE.
 ; The caller's X survives: the cell index rides the stack (the
 ; callees below reuse every scratch register).
+; D-31: the division left the COLUMN in SCR1 and the ROW in SCR2,
+; but cell_addr expects (row, col) - the swap made every level
+; tower draw at tile row 11 (and, with BTILE also zeroed, the
+; towers never rendered at all; the game played invisible bricks).
 queue_cell_tiles:
     txa
     pha
     sta SCR1                 ; the dividend (cell index)
     lda #$00
-    sta SCR2                 ; col = 0
+    sta SCR2                 ; row = 0
 qct_div:
     lda SCR1
     cmp #$0E
@@ -916,6 +984,12 @@ qct_div:
     inc SCR2
     jmp qct_div
 qct_have:
+    lda SCR1                 ; SCR1 = the column (index mod 14)
+    pha
+    lda SCR2                 ; SCR2 = the row (index div 14)
+    sta SCR1
+    pla
+    sta SCR2                 ; cell_addr wants (SCR1 row, SCR2 col)
     jsr cell_addr            ; SCR1 row / SCR2 col -> TMPA/TMPB
     lda BTILE
     jsr queue_put
@@ -1008,14 +1082,19 @@ crb_nc2:
 ; ---------------------------------------------------------------------------
 queue_put:
     ; A = value, TMPA/TMPB = full VRAM address.
+    ; D-31: the slot index is computed from the accumulator alone - no
+    ; shared scratch - so an NMI landing mid-put can no longer skew the
+    ; slot (the old `sta QOFF` scratch was the race the ghost HUD writes
+    ; came from). The NMI now only advances QHEAD; QLEN is reset solely
+    ; by the main loop's compaction at the frame start, where no NMI
+    ; can be in flight.
     pha
     lda QLEN
     cmp #QMAX
     bcs qp_drop
-    sta QOFF
-    asl a
+    asl a                 ; 2*QLEN
     clc
-    adc QOFF                 ; 3*QLEN
+    adc QLEN              ; 3*QLEN
     tay
     lda TMPA
     sta QUEUE0,y
@@ -1084,17 +1163,20 @@ df_done:
     rts
 
 status_score:
+    ; the four score digits, MSB first at columns 8..11 (the D-33
+    ; HUD columns: labels and values never share a tile).
     ldx #$00
 ss_loop:
-    lda DIGU,x
+    lda DIGU,x              ; units, tens, hundreds, thousands
     clc
     adc #$10
     sta SCR3
     lda #$20
     sta TMPA
     txa
+    eor #$03                ; 3-X
     clc
-    adc #$01                 ; cols 1..4
+    adc #$08                ; column 11-X: units at 11, thousands at 8
     sta TMPB
     lda SCR3
     jsr queue_put
@@ -1104,22 +1186,14 @@ ss_loop:
     rts
 
 status_level:
-    lda #$28                 ; the 'L' tile
-    sta SCR3
-    lda #$20
-    sta TMPA
-    lda #$08
-    sta TMPB
-    lda SCR3
-    jsr queue_put
+    ; the level digit at column 19, then the lives icons.
     lda LEVEL
     clc
-    adc #$31                 ; ASCII '1'+level
-    jsr char_tile
+    adc #$11                ; digits '1'..'3' for LEVEL 0..2
     sta SCR3
     lda #$20
     sta TMPA
-    lda #$09
+    lda #$13                ; column 19: the LEVEL value
     sta TMPB
     lda SCR3
     jsr queue_put
@@ -1127,6 +1201,7 @@ status_level:
     rts
 
 status_lives:
+    ; one icon per remaining life at columns 27..29 (blank beyond).
     ldx #$00
 sl_loop:
     cpx LIVES
@@ -1141,7 +1216,7 @@ sl_put:
     sta TMPA
     txa
     clc
-    adc #$1A                  ; cols 26..28
+    adc #$1B                  ; columns 27..29
     sta TMPB
     lda SCR3
     jsr queue_put
@@ -1377,20 +1452,23 @@ nmi_drained:
     clc
     adc QOFF
     sta QHEAD
-    cmp QLEN
-    bcc nmi_keepq
-    lda #$00             ; fully drained: the queue is empty again
-    sta QLEN
-    sta QHEAD
-nmi_keepq:
+    ; QLEN is never reset here (D-31): a mid-put NMI used to zero it and
+    ; the interrupted append then wrote over live slots - the phantom
+    ; HUD entries. The main loop compacts QLEN/QHEAD at its frame start,
+    ; a point no NMI can preempt.
 
     ; D-31: the canonical scroll reset after the frame's VRAM writes.
     ; Every queue drain writes $2006/$2007, which leaves the loopy t
     ; register pointing at the last written cell; without restoring
     ; it here the picture drifted a little every frame. The reset is
-    ; the documented sequence: $2000 (nametable select) then two
-    ; $2005 writes (0,0) - applied AFTER the last PPU write of the
-    ; frame, so v reloads from a stable t at the pre-render line.
+    ; the documented sequence: clear the vblank flag first (a PPUCTRL
+    ; rewrite with NMI enabled while vblank is still set re-triggers
+    ; the NMI edge - the calibrated emulator behavior the ppu_vbl_nmi
+    ; tests pin down - and a re-triggered NMI storm was the source of
+    ; the phantom HUD entries), then $2000 (nametable select) then
+    ; two $2005 writes (0,0), after the last PPU write of the frame,
+    ; so v reloads from a stable t at the pre-render line.
+    lda PPUSTAT           ; clears the vblank flag: no NMI re-trigger
     lda #$80
     sta $2000
     lda #$00
@@ -1432,6 +1510,7 @@ wram_update:
 ; data -----------------------------------------------------------------------
 txt_ptrs:
     .dw txt_title, txt_sub, txt_press, txt_over, txt_win, txt_attract, chr_tiles, font_digits, font_letters
+    .dw txt_hscore, txt_hlevel, txt_hlives
 
 txt_title:   .db "SHEIKHEMU", 0
 txt_sub:     .db "BREAKOUT", 0
@@ -1440,6 +1519,9 @@ txt_over:    .db "GAME OVER", 0
 txt_win:     .db "YOU WIN", 0
 txt_attract: .db "ATTRACT", 0
 txt_level:   .db "LEVEL "
+txt_hscore:  .db "SCORE", 0
+txt_hlevel:  .db "LEVEL", 0
+txt_hlives:  .db "LIVES", 0
 
 letter_map:
     .db $20,$21,$22,$00,$23,$00,$24,$25,$26,$00,$27,$28,$29,$2A,$2B,$2C
