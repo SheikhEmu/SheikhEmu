@@ -53,6 +53,8 @@ enum CommandError {
     ScriptUnreadable,
     /// The input script could not be parsed (Arabic reason).
     ScriptBad(String),
+    /// The WAV audio file could not be written.
+    WavUnwritable,
 }
 
 impl std::fmt::Display for CommandError {
@@ -100,6 +102,9 @@ impl std::fmt::Display for CommandError {
             }
             CommandError::ScriptBad(reason) => {
                 write!(f, "سيناريو الإدخال غير صالح: {reason}")
+            }
+            CommandError::WavUnwritable => {
+                write!(f, "تعذر كتابة ملف الصوت WAV — تحقق من المسار والصلاحيات")
             }
         }
     }
@@ -176,6 +181,23 @@ fn run(args: &[String]) -> u8 {
             print_script_help();
             0
         }
+        Some("wav") => match args.get(2) {
+            Some(path) => match wav_command(path, &args[3..]) {
+                Ok(report) => {
+                    println!("{report}");
+                    0
+                }
+                Err(err) => {
+                    eprintln!("خطأ: {err}");
+                    1
+                }
+            },
+            None => {
+                eprintln!("خطأ: الأمر wav يحتاج مسار ملف ROM");
+                eprintln!("الاستعمال: se-cli wav <ملف.nes> --frames N --out <ملف.wav>");
+                2
+            }
+        },
         Some(other) => {
             eprintln!("خطأ: أمر غير معروف: {other}");
             print_usage();
@@ -191,6 +213,8 @@ fn print_usage() {
     println!("  se-cli run <ملف.nes> --frames N [--hash] [--trace-cpu <ملف>]");
     println!("        [--instructions N] [--start-pc <عنوان-ست-عشري>] [--dump-frame <ملف.png>]");
     println!("        [--dump-plane <ملف>] [--input-script <ملف>] [--dump-ram <ملف>] [--dump-video <مجلد>]");
+    println!("  se-cli wav <ملف.nes> --frames N --out <ملف.wav> [--input-script <ملف>]");
+    println!("        صوت التشغيل الحتمي: PCM خام 16-bit بالمعدل الأصلي للمنطقة + بصمة PCM");
     println!("  se-cli script-help    صيغة ملف سيناريو الإدخال");
     println!("  se-cli -h | --help      هذه المساعدة");
 }
@@ -420,9 +444,10 @@ fn region_of(rom: &InesRom) -> Region {
     }
 }
 
-/// Execute a ROM headless and produce the Arabic run report.
-fn run_command(path: &str, flags: &[String]) -> Result<String, CommandError> {
-    let options = RunOptions::parse(flags)?;
+/// Parse a ROM file and build the machine for it (the shared loader of
+/// the `run` and `wav` commands: the M3 mapper set plus the minimal
+/// MMC1, CHR choice, mirroring and PRG RAM rules).
+fn machine_from_file(path: &str) -> Result<(Machine, Region), CommandError> {
     let data = fs::read(path).map_err(|_| CommandError::FileUnreadable)?;
     let rom = parse(&data)?;
     // The M3 mapper set: the T1 family plus the minimal MMC1 (the
@@ -448,7 +473,7 @@ fn run_command(path: &str, flags: &[String]) -> Result<String, CommandError> {
         Mirroring::FourScreen => CoreMirroring::FourScreen,
     };
     let prg_ram = rom.battery || rom.prg_ram.is_some_and(|bytes| bytes > 0) || rom.mapper == 1;
-    let mut machine = Machine::from_rom(
+    let machine = Machine::from_rom(
         rom.prg,
         rom.mapper,
         rom.submapper,
@@ -457,6 +482,13 @@ fn run_command(path: &str, flags: &[String]) -> Result<String, CommandError> {
         prg_ram,
         region,
     )?;
+    Ok((machine, region))
+}
+
+/// Execute a ROM headless and produce the Arabic run report.
+fn run_command(path: &str, flags: &[String]) -> Result<String, CommandError> {
+    let options = RunOptions::parse(flags)?;
+    let (mut machine, region) = machine_from_file(path)?;
 
     // Test-ROM automation entry (nestest convention) or a real reset.
     match options.start_pc {
@@ -594,6 +626,7 @@ fn run_command(path: &str, flags: &[String]) -> Result<String, CommandError> {
             "بصمة الإطار: {:016x}\n",
             machine.ppu().last_plane_hash()
         ));
+        report.push_str(&format!("بصمة PCM: {:016x}\n", machine.pcm_hash()));
     }
     // The blargg $6000 protocol report (when the cartridge carries
     // WRAM): the $DE $B0 signature, the status byte and the
@@ -627,6 +660,166 @@ fn run_command(path: &str, flags: &[String]) -> Result<String, CommandError> {
         fs::write(std::path::Path::new(file), machine.ppu().last_frame_plane())
             .map_err(|_| CommandError::FrameUnwritable)?;
         report.push_str(&format!("مستوى الإطار الخام: {file}\n"));
+    }
+    Ok(report)
+}
+
+/// Options of the `wav` command (M4.2: the deterministic audio writer).
+#[derive(Debug)]
+struct WavOptions {
+    frames: u32,
+    out: String,
+    input_script: Option<String>,
+}
+
+impl WavOptions {
+    /// Parse the flag list after the ROM path.
+    fn parse(flags: &[String]) -> Result<Self, CommandError> {
+        let mut frames = None;
+        let mut out = None;
+        let mut input_script = None;
+        let mut i = 0;
+        while i < flags.len() {
+            match flags[i].as_str() {
+                "--frames" => {
+                    let value = flags
+                        .get(i + 1)
+                        .and_then(|f| f.parse::<u32>().ok())
+                        .ok_or_else(|| {
+                            CommandError::BadArgument("--frames يحتاج رقمًا موجبًا".to_string())
+                        })?;
+                    frames = Some(value);
+                    i += 2;
+                }
+                "--out" => {
+                    let value = flags.get(i + 1).ok_or_else(|| {
+                        CommandError::BadArgument("--out يحتاج مسار ملف WAV".to_string())
+                    })?;
+                    out = Some(value.clone());
+                    i += 2;
+                }
+                "--input-script" => {
+                    let value = flags.get(i + 1).ok_or_else(|| {
+                        CommandError::BadArgument("--input-script يحتاج مسار ملف".to_string())
+                    })?;
+                    input_script = Some(value.clone());
+                    i += 2;
+                }
+                other => {
+                    return Err(CommandError::BadArgument(other.to_string()));
+                }
+            }
+        }
+        Ok(WavOptions {
+            frames: frames
+                .ok_or_else(|| CommandError::BadArgument("حدّد المدة: --frames N".to_string()))?,
+            out: out.ok_or_else(|| {
+                CommandError::BadArgument("حدّد ملف الإخراج: --out <ملف.wav>".to_string())
+            })?,
+            input_script,
+        })
+    }
+}
+
+/// Encode a mono 16-bit PCM WAV file (the canonical 44-byte header plus
+/// the little-endian samples) at the declared native rate.
+fn wav_bytes(samples: &[i16], rate: u32) -> Vec<u8> {
+    let data_len = samples.len() * 2;
+    let mut out = Vec::with_capacity(44 + data_len);
+    out.extend_from_slice(b"RIFF");
+    out.extend_from_slice(&(36u32 + data_len as u32).to_le_bytes());
+    out.extend_from_slice(b"WAVE");
+    out.extend_from_slice(b"fmt ");
+    out.extend_from_slice(&16u32.to_le_bytes());
+    out.extend_from_slice(&1u16.to_le_bytes()); // PCM
+    out.extend_from_slice(&1u16.to_le_bytes()); // mono
+    out.extend_from_slice(&rate.to_le_bytes());
+    out.extend_from_slice(&(rate * 2).to_le_bytes()); // byte rate
+    out.extend_from_slice(&2u16.to_le_bytes()); // block align
+    out.extend_from_slice(&16u16.to_le_bytes()); // bits
+    out.extend_from_slice(b"data");
+    out.extend_from_slice(&(data_len as u32).to_le_bytes());
+    for &sample in samples {
+        out.extend_from_slice(&sample.to_le_bytes());
+    }
+    out
+}
+
+/// The `wav` command (M4.2): run a ROM deterministically, capture the
+/// native-rate PCM stream (one sample per CPU cycle, the integer mixer
+/// of the APU) and write it as a WAV file, reporting the sample count,
+/// the declared rate and the PCM fingerprint.
+fn wav_command(path: &str, flags: &[String]) -> Result<String, CommandError> {
+    let options = WavOptions::parse(flags)?;
+    let (mut machine, region) = machine_from_file(path)?;
+    machine.reset();
+
+    // The optional input scenario, applied at frame boundaries exactly
+    // like the `run` command.
+    let script = match options.input_script.as_deref() {
+        Some(file) => Some(
+            InputScript::parse(
+                &fs::read_to_string(file).map_err(|_| CommandError::ScriptUnreadable)?,
+            )
+            .map_err(CommandError::ScriptBad)?,
+        ),
+        None => None,
+    };
+
+    machine.enable_pcm_capture(true);
+    for frame_index in 0..options.frames {
+        if let Some(script) = &script {
+            let mut buttons = None;
+            for entry in script.schedule.iter() {
+                if entry.0 <= frame_index {
+                    buttons = Some(entry.1);
+                }
+            }
+            if let Some(buttons) = buttons {
+                machine.set_controller_buttons(0, buttons);
+            }
+        }
+        let target = machine.ppu().frame() + 1;
+        while machine.ppu().frame() < target {
+            if let Err(se_core::CpuError::Halted) = machine.step() {
+                return Err(CommandError::Halted {
+                    cycles: machine.cycle(),
+                    instructions: machine.instructions,
+                });
+            }
+        }
+    }
+    let samples = machine.take_pcm();
+    let rate = region.cpu_hz_rounded();
+    let bytes = wav_bytes(&samples, rate);
+    let byte_count = bytes.len();
+    fs::write(std::path::Path::new(&options.out), &bytes)
+        .map_err(|_| CommandError::WavUnwritable)?;
+
+    // The Arabic report.
+    let file_name = path.rsplit(['/', '\\']).next().unwrap_or(path);
+    let region_text = match region {
+        Region::Ntsc => "NTSC",
+        Region::Pal => "PAL",
+        Region::Dendy => "Dendy",
+    };
+    let duration = f64::from(u32::try_from(samples.len()).unwrap_or(u32::MAX)) / f64::from(rate);
+    let mut report = String::new();
+    report.push_str(&format!("تقرير الصوت: {file_name}\n"));
+    report.push_str(&format!("المنطقة: {region_text}\n"));
+    report.push_str(&format!("الإطارات المكتملة: {}\n", options.frames));
+    report.push_str(&format!(
+        "عينات PCM: {} (معدل أصلي {rate} هرتز)\n",
+        samples.len()
+    ));
+    report.push_str(&format!("بصمة PCM: {:016x}\n", machine.pcm_hash()));
+    report.push_str(&format!("مدة الصوت: {duration:.3} ثانية\n"));
+    report.push_str(&format!(
+        "الملف المكتوب: {} ({byte_count} بايت)\n",
+        options.out
+    ));
+    if let Some(file) = options.input_script.as_deref() {
+        report.push_str(&format!("سيناريو الإدخال: {file}\n"));
     }
     Ok(report)
 }
@@ -878,6 +1071,80 @@ mod tests {
         assert!(report.contains("المنطقة: NTSC"));
         assert!(report.contains("الدورات المنفّذة:"));
         assert!(report.contains("التعليمات المنفّذة:"));
+    }
+
+    // ---- wav command (M4.2) -------------------------------------------------
+
+    #[test]
+    fn wav_header_is_the_canonical_44_byte_layout() {
+        let bytes = wav_bytes(&[0, 1, -2, 3], 1_789_773);
+        assert_eq!(&bytes[0..4], b"RIFF");
+        assert_eq!(&bytes[8..12], b"WAVE");
+        assert_eq!(&bytes[12..16], b"fmt ");
+        assert_eq!(&bytes[36..40], b"data");
+        assert_eq!(
+            u32::from_le_bytes(bytes[4..8].try_into().expect("riff size")),
+            36 + 8
+        );
+        assert_eq!(
+            u32::from_le_bytes(bytes[16..20].try_into().expect("fmt size")),
+            16
+        );
+        assert_eq!(
+            u16::from_le_bytes(bytes[20..22].try_into().expect("format")),
+            1
+        );
+        assert_eq!(
+            u16::from_le_bytes(bytes[22..24].try_into().expect("channels")),
+            1
+        );
+        assert_eq!(
+            u32::from_le_bytes(bytes[24..28].try_into().expect("rate")),
+            1_789_773
+        );
+        assert_eq!(
+            u32::from_le_bytes(bytes[28..32].try_into().expect("byte rate")),
+            3_579_546
+        );
+        assert_eq!(
+            u32::from_le_bytes(bytes[40..44].try_into().expect("data size")),
+            8
+        );
+        assert_eq!(bytes.len(), 44 + 8);
+        assert_eq!(&bytes[44..46], &0i16.to_le_bytes());
+        assert_eq!(&bytes[46..48], &1i16.to_le_bytes());
+        assert_eq!(&bytes[48..50], &(-2i16).to_le_bytes());
+        assert_eq!(&bytes[50..52], &3i16.to_le_bytes());
+    }
+
+    #[test]
+    fn wav_command_writes_a_deterministic_file() {
+        let path = temp_path("wav");
+        fs::write(&path, nop_rom()).expect("write ROM");
+        let out = std::env::temp_dir().join(format!("se-cli-wav-{}.wav", std::process::id()));
+        let flags: Vec<String> = ["--frames", "2", "--out", out.to_str().expect("utf8")]
+            .iter()
+            .map(|s| s.to_string())
+            .collect();
+        let report = wav_command(path.to_str().expect("utf8"), &flags).expect("wav runs");
+        assert!(report.contains("تقرير الصوت"));
+        assert!(report.contains("بصمة PCM"));
+        assert!(report.contains("1789773"));
+        let first = fs::read(&out).expect("wav written");
+        let _ = wav_command(path.to_str().expect("utf8"), &flags).expect("wav runs again");
+        let second = fs::read(&out).expect("wav written again");
+        assert_eq!(first, second, "identical runs give identical WAV bytes");
+        fs::remove_file(&out).ok();
+        fs::remove_file(&path).ok();
+    }
+
+    #[test]
+    fn wav_command_requires_frames_and_out() {
+        let err = WavOptions::parse(&[]).expect_err("missing options");
+        assert!(err.to_string().contains("--frames"));
+        let err = WavOptions::parse(&["--frames".to_string(), "2".to_string()])
+            .expect_err("missing --out");
+        assert!(err.to_string().contains("--out"));
     }
 
     #[test]

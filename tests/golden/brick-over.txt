@@ -3,5 +3,11 @@
 #     --input-script tests/input/brick-over.txt --hash
 # The deterministic loss: left-held steering misses every serve.
 # Regenerate on purpose after engine or game changes (DECISIONS.md first).
+# 2026-11-14: 80a61da7f85d4669 -> 3ee17f8cfe814f4c, the one-time
+#  D-37-approved migration of M4.2 (the complete APU state joins the
+#  state fingerprint, D-39). The frame fingerprint is identical before
+#  and after (eb49777a85cebc82) and the WRAM play values held
+#  (outcome 1, lives 0).
+# PCM fingerprint: e31aed083f00df8f.
 frames=1000
-hash=80a61da7f85d4669
+hash=3ee17f8cfe814f4c

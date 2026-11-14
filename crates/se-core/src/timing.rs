@@ -116,6 +116,19 @@ impl Region {
     pub fn fps(self) -> f64 {
         self.ppu_hz() / self.ppu_dots_per_frame()
     }
+
+    /// The CPU clock rounded to the nearest integer hertz, for the
+    /// native PCM stream declaration (one APU output sample per CPU
+    /// cycle — M4.2): NTSC 1789772.727 -> 1789773, PAL 1662607.03 ->
+    /// 1662607, Dendy 1773447.5 -> 1773448. The error stays below one
+    /// part per million, far below any audible pitch difference.
+    pub const fn cpu_hz_rounded(self) -> u32 {
+        match self {
+            Region::Ntsc => 1_789_773,
+            Region::Pal => 1_662_607,
+            Region::Dendy => 1_773_448,
+        }
+    }
 }
 
 #[cfg(test)]

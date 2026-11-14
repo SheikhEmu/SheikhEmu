@@ -8,6 +8,11 @@
 #  completions); then 40e5e5b7fbd0e05b when the minimal MMC1 of D-22
 #  added the mapper register bytes to the hashed state — both within
 #  the same M2 series and the same approved one-time re-baseline.
+# 2026-11-14: 40e5e5b7fbd0e05b -> 2c0bc2ca806dfea8, the one-time
+#  D-37-approved migration of M4.2: the complete APU state joins the
+#  state fingerprint and $4015 reads became the live status (D-39).
+#  Display pixels unchanged (frame fingerprint identical before and
+#  after: 3fd4ebc4ab9ce325). PCM fingerprint: d6150fe3e769fe27.
 # The determinism requirement itself is unchanged.
 frames=600
-hash=40e5e5b7fbd0e05b
+hash=2c0bc2ca806dfea8

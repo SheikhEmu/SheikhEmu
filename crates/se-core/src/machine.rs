@@ -18,6 +18,7 @@
 //! so rendered frames average 29,780.5 CPU cycles exactly as the
 //! documented timing table promises.
 
+use crate::apu::Apu;
 use crate::bus::{BusError, NesBus};
 use crate::cpu::{Cpu, CpuError};
 use crate::ppu::{Chr, Mirroring, Ppu};
@@ -30,6 +31,12 @@ const FNV_PRIME: u64 = 0x0000_0100_0000_01b3;
 
 /// The NMI vector.
 const NMI_VECTOR: u16 = 0xFFFA;
+
+/// The IRQ vector (the APU interrupt lines, M4.2).
+const IRQ_VECTOR: u16 = 0xFFFE;
+
+/// The status-register I flag mask.
+const I_FLAG: u8 = 0x04;
 
 /// The M2 machine: CPU + NROM bus with the real PPU.
 #[derive(Clone, Debug)]
@@ -93,8 +100,11 @@ impl Machine {
         self.bus.cycle()
     }
 
-    /// Power-on reset: seven cycles, PC from `$FFFC`, `S -= 3`.
+    /// Power-on reset: the documented APU reset effect first ($4015
+    /// as $00, triangle phase zero, DMC level bit 0), then seven CPU
+    /// cycles, PC from `$FFFC`, `S -= 3`.
     pub fn reset(&mut self) {
+        self.bus.apu_mut().reset();
         let before = self.bus.cycle();
         let cycles = u64::from(self.cpu.reset(&mut self.bus));
         let advanced = self.bus.cycle() - before;
@@ -116,18 +126,23 @@ impl Machine {
         self.instructions = 0;
     }
 
-    /// Execute one instruction (or service one pending NMI first);
-    /// returns the CPU cycles the instruction itself consumed.
+    /// Execute one instruction (or service one pending interrupt
+    /// first); returns the CPU cycles the instruction itself consumed.
     ///
-    /// NMI is edge-latched inside the PPU and consumed here at the
-    /// instruction boundary (the documented B1 sampling point; the
-    /// delayed-IRQ and interrupt-hijack refinements are deferred to
-    /// the scheduler milestone with real interrupt sources).
+    /// NMI is edge-latched inside the PPU; the APU IRQ line
+    /// (frame IRQ or DMC IRQ) is level-triggered and masked by the I
+    /// flag — both are consumed here at the instruction boundary (the
+    /// documented B1 sampling point; the delayed-IRQ and
+    /// interrupt-hijack refinements are deferred to the scheduler
+    /// milestone with real interrupt sources).
     pub fn step(&mut self) -> Result<u8, CpuError> {
         let nmi = self.bus.ppu_mut().take_nmi();
+        let irq = self.bus.apu().irq_level() && self.cpu.p & I_FLAG == 0;
         let before = self.bus.cycle();
         let cycles = if nmi {
             self.cpu.service_interrupt(&mut self.bus, NMI_VECTOR)
+        } else if irq {
+            self.cpu.service_interrupt(&mut self.bus, IRQ_VECTOR)
         } else {
             self.cpu.step(&mut self.bus)?
         };
@@ -181,6 +196,39 @@ impl Machine {
     /// The PPU (frames, planes, protocol reads).
     pub fn ppu(&self) -> &Ppu {
         self.bus.ppu()
+    }
+
+    /// The APU (PCM capture, the state hash, the CLI).
+    pub fn apu(&self) -> &Apu {
+        self.bus.apu()
+    }
+
+    /// Mutable APU access (tests, the frontend).
+    pub fn apu_mut(&mut self) -> &mut Apu {
+        self.bus.apu_mut()
+    }
+
+    /// Enable or disable PCM byte capture (the fingerprint is
+    /// computed regardless — see [`Self::pcm_hash`]).
+    pub fn enable_pcm_capture(&mut self, on: bool) {
+        self.bus.apu_mut().set_capture(on);
+    }
+
+    /// Drain the captured PCM samples (one per CPU cycle).
+    pub fn take_pcm(&mut self) -> Vec<i16> {
+        self.bus.apu_mut().take_pcm()
+    }
+
+    /// The PCM fingerprint (FNV-1a over every produced sample since
+    /// power-on) — the same run, the same fingerprint, on every
+    /// platform.
+    pub fn pcm_hash(&self) -> u64 {
+        self.bus.apu().pcm_hash()
+    }
+
+    /// Total PCM samples produced (one per CPU cycle since power-on).
+    pub fn pcm_samples(&self) -> u64 {
+        self.bus.apu().samples()
     }
 
     /// Deterministic state signature (FNV-1a 64) of the machine.
@@ -252,6 +300,13 @@ impl Machine {
             for byte in chr {
                 hash = mix_u8(hash, *byte);
             }
+        }
+        // The complete APU state joins the state fingerprint (M4.2,
+        // the declared D-37 migration): every channel, the frame
+        // sequencer, the IRQ flags and the DC-blocker state — all of
+        // it integer, so the fingerprint stays portable.
+        for byte in self.bus.apu().state_bytes() {
+            hash = mix_u8(hash, byte);
         }
         hash
     }

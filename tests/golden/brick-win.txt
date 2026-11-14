@@ -3,5 +3,11 @@
 #     --input-script tests/input/brick-win.txt --hash
 # The full deterministic playthrough: attract start, cleanup, three towers cleared through real bank switches, YOU WIN.
 # Regenerate on purpose after engine or game changes (DECISIONS.md first).
+# 2026-11-14: d08b47c6957ab090 -> 2c0ecebdc3f07fd1, the one-time
+#  D-37-approved migration of M4.2 (the complete APU state joins the
+#  state fingerprint, D-39). The frame fingerprint is identical before
+#  and after (a9845339060bb531) and every WRAM play value held
+#  (outcome 2, level 3rd, lives 3, bank writes 3, bricks 15).
+# PCM fingerprint: 0bce725ab5a7a537.
 frames=2100
-hash=d08b47c6957ab090
+hash=2c0ecebdc3f07fd1

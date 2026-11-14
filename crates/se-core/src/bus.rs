@@ -1,17 +1,17 @@
-//! CPU-visible memory map of the NES for milestone M2.
+//! CPU-visible memory map of the NES.
 //!
 //! The map follows the public NESdev Wiki "CPU memory map":
 //!
-//! | Range        | M2 implementation                                        |
+//! | Range        | M4 implementation                                        |
 //! |--------------|----------------------------------------------------------|
 //! | `$0000-$07FF`| 2 KiB internal RAM                                        |
 //! | `$0008-$1FFF`| mirrors of the RAM (repeat every `$0800`)                 |
 //! | `$2000-$3FFF`| PPU registers, mirrored every 8 bytes (real PPU in M2)    |
-//! | `$4000-$4013`| APU registers (fixed `$FF` read until M4, D-18)            |
+//! | `$4000-$4013`| APU channel registers (real APU in M4; reads keep the D-18 reference `$FF`) |
 //! | `$4014`      | OAM DMA trigger (write launches the 513/514-cycle DMA)   |
-//! | `$4015`      | APU status (fixed `$FF` read until M4, D-18)             |
+//! | `$4015`      | APU status (live read since M4.2)                        |
 //! | `$4016`      | strobe write (both joypads) / joypad 1 read (M3)        |
-//! | `$4017`      | joypad 2 read (APU frame counter write arrives in M4)    |
+//! | `$4017`      | joypad 2 read (M3) / APU frame counter write (M4.2)      |
 //! | `$4018-$401F`| test-mode registers (unused)                              |
 //! | `$4020-$5FFF`| cartridge expansion area (open bus)                        |
 //! | `$6000-$7FFF`| PRG RAM when the cartridge declares it                     |
@@ -22,17 +22,18 @@
 //! latch. Full open bus is a B2 item; the latch is the documented B1
 //! simplification (spec §5.3).
 //!
-//! ## Clocking model (scheduler decision D-16, spec §5.0.1)
+//! ## Clocking model (scheduler decision D-20, spec §5.0.1)
 //!
 //! The bus owns the master CPU-cycle counter. Every CPU read/write
 //! performed through the [`cpu::Bus`] trait is exactly one CPU cycle:
 //! the access is serviced first, then the PPU advances by the
 //! region's dots-per-cycle ratio (3 on NTSC/Dendy; the PAL 16:5 ratio
-//! via an integer accumulator). The machine true-ups any internal
-//! (non-access) instruction cycles at instruction end, so the PPU is
-//! exactly synchronized at every instruction boundary, and direct
-//! register accesses land on their exact cycle inside an instruction.
+//! via an integer accumulator), then the APU ticks once — and the DMC
+//! memory reader's fetches stall the CPU as deferred cycles (D-38
+//! B1: three idle cycles plus the fetch cycle) charged to the same
+//! master clock.
 
+use crate::apu::Apu;
 use crate::cpu::Bus;
 use crate::input::Controllers;
 use crate::mapper::{CartSpec, Cartridge, MapperError, Registry};
@@ -96,8 +97,8 @@ impl std::fmt::Display for BusError {
 
 impl std::error::Error for BusError {}
 
-/// The M3 CPU bus: RAM + the cartridge (T1 mapper framework) +
-/// optional PRG RAM + the real PPU and controllers.
+/// The M4 CPU bus: RAM + the cartridge (T1 mapper framework) +
+/// optional PRG RAM + the real PPU, controllers and APU.
 #[derive(Clone, Debug)]
 pub struct NesBus {
     ram: [u8; RAM_BYTES],
@@ -111,6 +112,9 @@ pub struct NesBus {
     cycles: u64,
     /// The two standard controllers ($4016/$4017, M3).
     pads: Controllers,
+    /// The APU (M4.2): five channels, the frame sequencer, the
+    /// deterministic integer mixer and the PCM stream.
+    apu: Apu,
     /// Fractional dot accumulator: `acc += cpu_div` per cycle, and
     /// one PPU dot ticks per `ppu_div` accumulated (NTSC/Dendy 12/4
     /// = 3 dots; PAL 16/5 = 3.2 dots per cycle).
@@ -183,6 +187,7 @@ impl NesBus {
             cycles: 0,
             dot_acc: 0,
             pads: Controllers::default(),
+            apu: Apu::new(region),
         })
     }
 
@@ -197,15 +202,19 @@ impl NesBus {
     }
 
     /// Advance `n` CPU cycles without a bus access (the true-up for
-    /// internal instruction cycles; each still ticks the PPU).
+    /// internal instruction cycles; each still ticks the PPU and the
+    /// APU, and services DMC fetches).
     pub fn advance_cycles(&mut self, n: u64) {
         for _ in 0..n {
             self.advance_one_cycle();
         }
     }
 
-    /// One CPU cycle: the PPU advances by the region's dots ratio.
-    fn advance_one_cycle(&mut self) {
+    /// One CPU cycle of the raw master clock: the PPU dots of the
+    /// cycle, then the APU (spec §5.0.1 order: CPU, PPU, APU). No DMC
+    /// fetch is serviced inside (the caller decides — the OAM DMA
+    /// defers DMC fetches per D-38 B1).
+    fn tick_cycle(&mut self) {
         self.cycles += 1;
         self.dot_acc += u64::from(self.region.cpu_divisor());
         let per = u64::from(self.region.ppu_divisor());
@@ -213,6 +222,36 @@ impl NesBus {
             self.dot_acc -= per;
             self.ppu.tick();
         }
+        self.apu.tick();
+    }
+
+    /// One CPU cycle plus the DMC memory-reader stall: when the APU
+    /// wants a sample byte, the CPU is suspended for four cycles —
+    /// three idle cycles, then the fetch cycle itself that reads the
+    /// byte from the cartridge ("APU DMC"; D-38 B1, the alignment
+    /// variants are B2). The stall cycles tick the PPU and APU as
+    /// normal cycles of the same master clock.
+    fn advance_one_cycle(&mut self) {
+        self.tick_cycle();
+        if let Some(addr) = self.apu.take_dma_request() {
+            for _ in 0..3 {
+                self.tick_cycle();
+            }
+            self.tick_cycle();
+            let value = self.service_read(addr);
+            self.apu.dma_complete(value);
+        }
+    }
+
+    /// The APU (shared with the machine for PCM capture, the state
+    /// hash and the CLI).
+    pub fn apu(&self) -> &Apu {
+        &self.apu
+    }
+
+    /// Mutable APU access (machine integration, tests).
+    pub fn apu_mut(&mut self) -> &mut Apu {
+        &mut self.apu
     }
 
     /// The PPU (shared with the machine for frames, hashing and CLI).
@@ -254,8 +293,12 @@ impl NesBus {
             // Joypads: the current serial output, no shifter advance.
             0x4016 => self.pads.peek(0),
             0x4017 => self.pads.peek(1),
-            // APU registers: the documented fixed $FF (D-18) until
-            // the APU arrives in M4.
+            // APU registers: the D-18 reference `$FF` view is kept
+            // for the trace logger and the check tools (the reference
+            // log's annotation convention — byte-identical nestest
+            // calibration). The live CPU read of `$4015` goes through
+            // `service_read`; the write-only registers keep the
+            // documented B1 constant until the B2 open-bus pass.
             0x4000..=0x4017 => 0xFF,
             0x6000..=0x7FFF => match &self.prg_ram {
                 Some(ram) => ram[usize::from(addr & 0x1FFF)],
@@ -322,7 +365,14 @@ impl NesBus {
             // advances the shifter (the real side effect).
             0x4016 => self.pads.read(0),
             0x4017 => self.pads.read(1),
-            // APU: the fixed $FF (D-18); $4014 is write-only.
+            // APU status: the live read (M4.2) with the frame flag
+            // cleared by the read; bit 5 is open bus (the last driven
+            // bus value). The write-only registers below keep the
+            // D-18 reference $FF for reads.
+            0x4015 => {
+                let status = self.apu.read_status();
+                (status & 0xDF) | (self.latch & 0x20)
+            }
             0x4000..=0x4017 => 0xFF,
             0x6000..=0x7FFF => match &self.prg_ram {
                 Some(ram) => ram[usize::from(addr & 0x1FFF)],
@@ -354,11 +404,22 @@ impl NesBus {
                 if addr == 0x4014 {
                     dma = Some(value);
                 }
-                // $4016 bit 0 strobes both joypads (M3); the APU
-                // registers (including the $4017 frame-counter
-                // write) arrive in M4.
+                // $4016 bit 0 strobes both joypads (M3).
                 if addr == 0x4016 {
                     self.pads.write_strobe(value);
+                }
+                // The APU registers (M4.2): channel writes, the status
+                // register and the frame-counter write with the
+                // documented 3-or-4-cycle reset delay (the delay rule
+                // uses the APU half-cycle phase: a write serviced just
+                // before an APU-rate cycle counts as "during" it).
+                if addr == 0x4015 {
+                    self.apu.write_status(value);
+                } else if addr == 0x4017 {
+                    let during_apu_cycle = !self.apu.half_phase();
+                    self.apu.write_frame_counter(value, during_apu_cycle);
+                } else if addr != 0x4014 && addr != 0x4016 {
+                    self.apu.write_register(addr, value);
                 }
             }
             0x6000..=0x7FFF => {
@@ -386,17 +447,19 @@ impl NesBus {
 
     /// Run the OAM DMA for `page`: one alignment cycle (two when the
     /// write ended on an odd cycle — the documented 513/514-cycle
-    /// rule), then 256 read/write pairs, each ticking the PPU.
+    /// rule), then 256 read/write pairs, each ticking the PPU and the
+    /// APU. DMC fetches requested during the transfer are deferred to
+    /// the next regular cycle (D-38 B1 defers the DMC/OAM interleave).
     fn run_oam_dma(&mut self, page: u8) {
         let idles = 1 + u64::from(self.cycles % 2 == 1);
         for _ in 0..idles {
-            self.advance_one_cycle();
+            self.tick_cycle();
         }
         for i in 0..256u16 {
             let value = self.service_read((u16::from(page) << 8) | i);
-            self.advance_one_cycle();
+            self.tick_cycle();
             self.service_write(0x2004, value);
-            self.advance_one_cycle();
+            self.tick_cycle();
         }
     }
 }
@@ -404,7 +467,11 @@ impl NesBus {
 impl Bus for NesBus {
     fn read(&mut self, addr: u16) -> u8 {
         let value = self.service_read(addr);
-        self.latch = value;
+        // $4015 is internal to the CPU: the read value does not
+        // affect the open-bus latch (NESdev "APU").
+        if addr != 0x4015 {
+            self.latch = value;
+        }
         self.advance_one_cycle();
         value
     }
