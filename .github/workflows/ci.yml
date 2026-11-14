@@ -20,6 +20,12 @@ jobs:
       - uses: dtolnay/rust-toolchain@stable
         with:
           components: clippy, rustfmt
+      - name: ALSA headers (M4.3)
+        # se-frontend's cpal (D-40) builds its ALSA backend on Linux:
+        # alsa-sys needs libasound headers at compile time. The other
+        # platforms need nothing extra.
+        if: runner.os == 'Linux'
+        run: sudo apt-get update && sudo apt-get install -y libasound2-dev
       - name: Formatting
         run: cargo fmt --check
       - name: Lint
@@ -37,6 +43,11 @@ jobs:
     steps:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@stable
+      - name: ALSA headers (M4.3)
+        # cargo-deny only resolves metadata, but keeping the ubuntu
+        # images consistent with the build job avoids surprises if a
+        # future gate ever compiles the workspace (cpal/alsa-sys).
+        run: sudo apt-get update && sudo apt-get install -y libasound2-dev
       - name: cargo-deny
         run: |
           cargo install cargo-deny --locked

@@ -10,13 +10,18 @@ publish.workspace = true
 name = "se-frontend"
 path = "src/main.rs"
 
-# D-27 (owner-approved 2026-11-13): winit and softbuffer are the only
-# two external crates of the whole project, allowed exclusively in
-# this crate (se-core / se-rom / se-cli stay zero-dependency). The
-# cost gate whitelists exactly these two names for exactly this
-# manifest; versions are locked in the committed Cargo.lock.
+# D-27 (owner-approved 2026-11-13) + D-40/M4.3 (owner-approved activation
+# 2026-11-14): winit, softbuffer and cpal are the only three external
+# crates of the whole project, allowed exclusively in this crate
+# (se-core / se-rom / se-cli stay zero-dependency). The cost gate
+# whitelists exactly these three names for exactly this manifest;
+# versions are locked in the committed Cargo.lock. The complete cpal
+# 0.18.2 dependency tree with its licenses (all permissive, zero viral
+# or share-alike: MIT / Apache-2.0 / BSD-2-Clause / Zlib / Unicode-3.0)
+# is recorded in docs/LEGAL_POLICY.md and DECISIONS.md D-40.
 [dependencies]
 se-core = { path = "../se-core", version = "0.1.0" }
 se-rom = { path = "../se-rom", version = "0.1.0" }
 softbuffer = "0.4"
 winit = "0.30"
+cpal = "0.18"

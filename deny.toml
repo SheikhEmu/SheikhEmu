@@ -1,6 +1,7 @@
 # cargo-deny configuration.
-# The workspace currently has zero external dependencies; these settings
-# guard future additions.
+# The workspace has exactly three external crates, all in
+# se-frontend only (D-27 winit+softbuffer, D-40/M4.3 cpal): every
+# other crate stays stdlib-only and these settings guard that.
 
 [advisories]
 unmaintained = "workspace"
@@ -12,6 +13,14 @@ unmaintained = "workspace"
 # transitively pulls exactly those two crates; both are OSI
 # permissive licenses in the same family as BSD-3-Clause, already
 # allowed. Nothing viral or copyleft entered the tree.
+# D-40 note (2026-11-14, M4.3): the cpal 0.18.2 tree was audited in
+# full (union of the linux/windows/macos targets, 132 external
+# name@version pairs incl. the winit+softbuffer lines — table in
+# docs/LEGAL_POLICY.md) and needed ZERO new allow entries: every
+# license expression in it resolves against this list (MIT /
+# Apache-2.0 / BSD-2-Clause / BSD-3-Clause / Zlib / ISC / Unlicense /
+# Unicode-3.0 / Apache-2.0 WITH LLVM-exception). No viral,
+# copyleft or share-alike license exists anywhere in the tree.
 allow = [
     "GPL-3.0-or-later",
     "MIT",
@@ -33,8 +42,13 @@ wildcards = "deny"
 # major versions inside the winit + softbuffer transitive trees
 # (owner-approved external crates, se-frontend only). The deny stays
 # the rule: anything not on this list still fails the gate.
+# D-40 note (2026-11-14, M4.3): adding cpal 0.18.2 (owner-approved,
+# se-frontend only) required exactly ONE new skip — block2@0.5.1 —
+# with its written reason inline; every other duplicate in the
+# combined three-crate tree was already covered by the D-27 list.
 skip = [
     { crate = "bitflags@1.3.2", reason = "winit's core-graphics 0.23 (macOS) and redox_syscall 0.4 still build on bitflags 1.x" },
+    { crate = "block2@0.5.1", reason = "winit's objc2-foundation 0.2 line still builds on block2 0.5 while cpal 0.18's coreaudio path (D-40/M4.3) uses block2 0.6" },
     { crate = "getrandom@0.3.4", reason = "ahash (winit's hasher dep) builds on getrandom 0.3 while cc's jobserver uses 0.4" },
     { crate = "jni-sys@0.3.1", reason = "android-activity (winit) uses jni-sys 0.3 alongside jni 0.4's own jni-sys 0.4" },
     { crate = "objc2@0.5.3", reason = "winit's macOS backend uses objc2 0.5 while objc2-foundation 0.3 uses objc2 0.6" },

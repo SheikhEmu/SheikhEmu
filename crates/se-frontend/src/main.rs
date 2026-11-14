@@ -1,6 +1,7 @@
-//! The M3.3 minimal window frontend of SheikhEmu.
+//! The window frontend of SheikhEmu (M3.3 core, M4.3 audio).
 //!
-//! Spec scope of this milestone (§5.5 + §5.5.1 + §7.3, D-26/D-27):
+//! Spec scope of this milestone slice (§5.5 + §5.5.1 + §7.3,
+//! D-26/D-27/D-40):
 //!
 //! - a window with the 256x240 picture at a correct **integer** scale
 //!   (`scale.rs`), black letterbox bars around it,
@@ -11,13 +12,20 @@
 //!   (D-16/D-26),
 //! - the §7.3 default keyboard control: arrows = D-pad, Z = A,
 //!   X = B, Enter = Start, both Shifts = Select (`keys.rs`),
-//! - **no sound** (that is M4's APU milestone), no pause menu, no
-//!   fullscreen — the minimal honest window,
-//! - everything on the single event-loop thread: one core thread, no
-//!   worker threads, no locks (§5.5.1, D-26).
+//! - **sound** (M4.3): the core's deterministic native-rate PCM is
+//!   resampled to the device and played through cpal on the device's
+//!   own callback thread — an SPSC ring between the two threads, no
+//!   locks anywhere in the audio path (`audio.rs`, `ring.rs`,
+//!   `resample.rs`, §5.5.1); a machine with no audio device runs the
+//!   game perfectly silent instead of failing,
+//! - no pause menu, no fullscreen — the minimal honest window,
+//! - the emulator and the display stay on the single event-loop
+//!   thread; the only second thread is the audio device's callback
+//!   (§5.5.1, D-26/D-40).
 //!
-//! The two external dependencies (`winit`, `softbuffer`) are the
-//! D-27 owner-approved whitelist, used only by this crate.
+//! The three external dependencies (`winit`, `softbuffer`, `cpal`)
+//! are the D-27/D-40 owner-approved whitelist, used only by this
+//! crate.
 //!
 //! Window systems differ; the CI never opens a window (it builds and
 //! runs the pure modules' tests headlessly). The window itself is
@@ -30,8 +38,11 @@
 //! window screenshot can be compared pixel-by-pixel with the same-state
 //! CLI frame (the owner's display evidence standard).
 
+mod audio;
 mod keys;
 mod pacing;
+mod resample;
+mod ring;
 mod scale;
 mod script;
 
@@ -73,6 +84,10 @@ struct Frontend {
     period: Duration,
     /// The instant the next emulated frame is due.
     deadline: Instant,
+    /// The realtime audio path (M4.3): native PCM in, device stream
+    /// out, SPSC ring between the event-loop thread and the device's
+    /// callback thread.
+    audio: audio::Audio,
     /// The window title (kept off the hot path).
     window_title: String,
     /// The softbuffer display context (from the event loop's owned
@@ -150,10 +165,13 @@ impl Frontend {
         let _ = buffer.present();
     }
 
-    /// Run one emulated frame, refresh the staging picture, present.
+    /// Run one emulated frame, refresh the staging picture, present,
+    /// and feed the frame's native-rate PCM to the audio path (M4.3).
     /// In replay mode the scenario's snapshot lands before the frame
     /// runs — the same frame-boundary contract as the CLI's input
-    /// script — and the live keyboard bitmap is ignored.
+    /// script — and the live keyboard bitmap is ignored. Audio is
+    /// realtime output only: it reads the core's samples and never
+    /// writes back, so the replay determinism is untouched.
     fn run_one_frame(&mut self) -> Result<(), CpuError> {
         let buttons = match &self.script {
             Some(script) => {
@@ -167,6 +185,7 @@ impl Frontend {
         self.machine.set_controller_buttons(0, buttons);
         self.machine.run_frames(1)?;
         self.machine.ppu().last_frame_rgb(&mut self.picture);
+        self.audio.feed(&self.machine.take_pcm());
         self.frames_done += 1;
         self.present();
         Ok(())
@@ -411,6 +430,10 @@ fn main() {
         }
     };
     machine.reset();
+    // The realtime PCM tap (M4.3): capture stays on and is drained
+    // every frame by the audio path; the core's own PCM fingerprint
+    // is maintained regardless (M4.2).
+    machine.enable_pcm_capture(true);
 
     let event_loop = match EventLoop::new() {
         Ok(loop_) => loop_,
@@ -433,6 +456,7 @@ fn main() {
         picture: Box::new([0; 256 * 240 * 3]),
         period: pacing::frame_period(region),
         deadline: Instant::now(),
+        audio: audio::Audio::pending(region),
         window_title: format!("محاكي SheikhEmu — {file_name}"),
         context,
         window: None,
@@ -448,4 +472,7 @@ fn main() {
         eprintln!("أُغلقت حلقة الأحداث بخطأ: {error}");
         std::process::exit(5);
     }
+    // The one-line Arabic audio report (M4.3): device, counts,
+    // underruns, drops — the honest realtime accounting.
+    frontend.audio.report();
 }

@@ -16,14 +16,19 @@ status=0
 
 echo "== cost gate =="
 
-# 1. No external crate dependencies outside the D-27 whitelist.
+# 1. No external crate dependencies outside the D-27/D-40 whitelist.
 #
-#    D-27 (owner-approved 2026-11-13): the ONLY external crates of the
-#    whole project are `winit` and `softbuffer`, and they are allowed
-#    ONLY in crates/se-frontend. Every other crate stays stdlib-only,
-#    and even se-frontend may not declare anything else external.
-#    Path dependencies are internal and always allowed.
-frontend_whitelist="winit softbuffer"
+#    D-27 (owner-approved 2026-11-13): the only external crates of
+#    the whole project were `winit` and `softbuffer`, allowed ONLY in
+#    crates/se-frontend. D-40/M4.3 (owner-approved 2026-11-14) added
+#    exactly ONE more name to that same single manifest: `cpal` (the
+#    audio output backend, owner pre-registered in principle by D-27
+#    and activated by the approved M4 plan). The explicit frontend
+#    statement is therefore {winit, softbuffer, cpal} and nothing
+#    else. Every other crate stays stdlib-only, and even se-frontend
+#    may not declare anything else external. Path dependencies are
+#    internal and always allowed.
+frontend_whitelist="winit softbuffer cpal"
 
 for manifest in crates/*/Cargo.toml; do
   case "$manifest" in
