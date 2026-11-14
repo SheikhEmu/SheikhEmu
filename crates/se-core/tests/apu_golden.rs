@@ -9,6 +9,16 @@
 //! committed goldens. Pure integer arithmetic end to end means the
 //! same values must come out on every platform (the CI matrix runs
 //! these on ubuntu, windows and macOS).
+//!
+//! Golden migration (B-10 fix, D-42, 2026-11-14): the DC-blocker pole
+//! now rounds toward zero instead of flooring, so the four values
+//! below moved in the owner-approved migration (old -> new):
+//! NTSC state 2bbd410b30f0f451 -> 10105af4c44a40ee, NTSC PCM
+//! afdc159028c540ec -> 3bacf2f1bf596773, PAL state
+//! 4f58f320851574e0 -> 9db2e8c80cbceb4f, PAL PCM
+//! d920be6eaf8a1f21 -> 7bafab61039b6cc0. The concert windows carry
+//! negative dc_y excursions (the old latch artifact); nothing else
+//! moved (see DECISIONS.md D-42 and EVIDENCE.md section 7).
 
 use se_core::machine::Machine;
 use se_core::timing::Region;
@@ -81,12 +91,12 @@ fn ntsc_concert_state_and_pcm_goldens() {
     let (_, state, pcm) = run_concert(Region::Ntsc, 45, false);
     assert_eq!(
         format!("{state:016x}"),
-        "2bbd410b30f0f451",
+        "10105af4c44a40ee",
         "NTSC concert state golden"
     );
     assert_eq!(
         format!("{pcm:016x}"),
-        "afdc159028c540ec",
+        "3bacf2f1bf596773",
         "NTSC concert PCM golden"
     );
 }
@@ -96,12 +106,12 @@ fn pal_concert_state_and_pcm_goldens() {
     let (_, state, pcm) = run_concert(Region::Pal, 45, false);
     assert_eq!(
         format!("{state:016x}"),
-        "4f58f320851574e0",
+        "9db2e8c80cbceb4f",
         "PAL concert state golden"
     );
     assert_eq!(
         format!("{pcm:016x}"),
-        "d920be6eaf8a1f21",
+        "7bafab61039b6cc0",
         "PAL concert PCM golden"
     );
 }

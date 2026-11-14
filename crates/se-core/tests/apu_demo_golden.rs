@@ -17,9 +17,14 @@
 //! The golden window is 1040 frames: all eight 128-frame phases plus
 //! the first 16 frames of the replayed silence. The silence phases are
 //! part of the fingerprint on purpose: their PCM encodes the DC
-//! blocker's current settling behavior (the negative-output latch
-//! documented in BLOCKERS.md; fixing it is an owner-approved golden
-//! migration, not a silent drift).
+//! blocker's settling behavior. The B-10/D-42 owner-approved migration
+//! (2026-11-14) moved exactly this golden pair together with the four
+//! concert values — the pole now rounds toward zero, so the trailing
+//! silence decays to exactly 0 instead of latching on the old
+//! -14323 constant: state 0c197976941b5b27 -> 3d15efeb5b82a7c8,
+//! PCM 7548173990dcf41e -> 1082b39f30867115 (old -> new; the
+//! decision, the values and the proof that nothing else moved are in
+//! DECISIONS.md D-42 and EVIDENCE.md sections 7 and 10.5).
 
 use se_core::machine::Machine;
 use se_core::ppu::{Chr, Mirroring};
@@ -28,8 +33,8 @@ use se_core::timing::Region;
 /// The demo window the goldens cover (frames).
 const GOLDEN_FRAMES: u32 = 1040;
 /// The committed NTSC goldens (see tests/golden/apu-demo.txt).
-const GOLDEN_STATE: &str = "0c197976941b5b27";
-const GOLDEN_PCM: &str = "7548173990dcf41e";
+const GOLDEN_STATE: &str = "3d15efeb5b82a7c8";
+const GOLDEN_PCM: &str = "1082b39f30867115";
 
 /// The apu_demo.nes PRG image: the identical bytes `make test-roms`
 /// assembles from tests/roms/src/apu_demo.asm. The cross-check test

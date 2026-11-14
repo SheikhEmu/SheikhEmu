@@ -19,8 +19,10 @@
 //! One output sample is produced per CPU cycle: the native stream rate
 //! is the CPU clock itself, derived from the master clock alone
 //! (NTSC 1789772.7 Hz, PAL 1662607.0 Hz, Dendy 1773447.5 Hz). A
-//! first-order integer high-pass (the DC blocker, pole 65535/65536)
-//! removes the DC component; the full NES analog filter chain
+//! first-order integer high-pass (the DC blocker, pole 65535/65536
+//! rounded toward zero at every step — the B-10/D-42 symmetric rule)
+//! removes the DC component for positive and negative states alike;
+//! the full NES analog filter chain
 //! (90 Hz / 440 Hz HPF, 14 kHz LPF) belongs to the frontend stage.
 //!
 //! ## B1 documented choices (D-39)
@@ -92,6 +94,35 @@ const DMC_RATES_NTSC: [u16; 16] = [
 const DMC_RATES_PAL: [u16; 16] = [
     398, 354, 316, 298, 276, 236, 210, 198, 176, 148, 132, 118, 98, 78, 66, 50,
 ];
+
+/// The DC-blocker pole step (B-10 fix, D-42): one application of the
+/// declared pole 65535/65536 to the previous filter state, evaluated
+/// with deterministic integer arithmetic that rounds **toward zero**.
+///
+/// The M4.2 code applied the pole as an arithmetic right shift
+/// (`(v * 65535) >> 16`), which is a floor: for every negative state
+/// in the whole output scale (`|v| < 65536` covers ±32767 entirely)
+/// the floored product equals `v` exactly, so each such state is a
+/// **fixed point**. The positive half decayed by one unit per sample
+/// to exactly zero, the negative half never decayed at all — after any
+/// musical silence the stream latched on a negative constant forever
+/// (measured on the apu_demo ROM: −14323 of ±32767, ~44% of the range,
+/// held through 2.4 s of trailing silence).
+///
+/// Dividing instead of shifting is the whole fix: Rust integer division
+/// truncates toward zero, which is sign-symmetric. The trajectory of
+/// every non-negative state is **byte for byte the value the shift
+/// produced** (floor and truncation agree on non-negative operands, so
+/// all existing positive-side behavior is provably unchanged), while
+/// every negative state now decays by at least one unit per sample
+/// toward exactly zero — the mirrored image of the positive side. Zero
+/// stays zero. There is no non-zero fixed point anywhere (the
+/// exhaustive property test below proves it over the operating scale),
+/// and the arithmetic stays integer-only and platform-independent, so
+/// the D-37 determinism condition still holds end to end.
+fn dc_pole(v: i64) -> i64 {
+    (v * 65_535) / 65_536
+}
 
 /// The frame-sequencer clock points in CPU cycles: the quarters
 /// (envelopes and the triangle linear counter), the halves (length
@@ -985,9 +1016,10 @@ impl Apu {
         let tnd_q15 = i32::try_from(numerator / den_tnd).unwrap_or(i32::MAX);
         let total_q15 = pulse_q15 + tnd_q15;
 
-        // DC blocker in Q15: y = x - x_prev + (y_prev * 65535 >> 16).
+        // DC blocker in Q15: y = x - x_prev + pole(y_prev), the pole
+        // step `dc_pole` below rounding 65535/65536 toward zero (D-42).
         let x = i64::from(total_q15);
-        let y = x - self.dc_x + ((self.dc_y * 65_535) >> 16);
+        let y = x - self.dc_x + dc_pole(self.dc_y);
         self.dc_x = x;
         self.dc_y = y;
         y.clamp(-32_767, 32_767) as i16
@@ -1630,6 +1662,104 @@ mod tests {
         );
         assert!(apu.pcm[10].abs() < apu.pcm[1].abs(), "decaying");
         assert!(apu.pcm[500].abs() < apu.pcm[10].abs(), "still decaying");
+    }
+
+    #[test]
+    fn dc_pole_has_no_nonzero_fixed_point() {
+        // The B-10/D-42 property, exhaustive over double the output
+        // scale: zero is the ONLY fixed point of the pole.
+        assert_eq!(dc_pole(0), 0);
+        for v in -131_072i64..=131_072 {
+            let next = dc_pole(v);
+            if v == 0 {
+                assert_eq!(next, 0);
+                continue;
+            }
+            assert!(
+                next == 0 || next.signum() == v.signum(),
+                "the sign is kept or the state lands exactly on zero at {v}"
+            );
+            assert!(
+                next.abs() < v.abs(),
+                "the magnitude strictly shrinks: no non-zero fixed point at {v}"
+            );
+            if v > 0 {
+                // The positive half is byte for byte the value the
+                // M4.2 arithmetic-shift pole produced: the fix provably
+                // changes no positive-side trajectory.
+                assert_eq!(
+                    next,
+                    (v * 65_535) >> 16,
+                    "the positive path is the old shift's value at {v}"
+                );
+            } else {
+                // The negative half is the exact mirror image of the
+                // positive one (truncation toward zero is symmetric).
+                assert_eq!(
+                    next,
+                    -((-v * 65_535) >> 16),
+                    "the negative path mirrors the positive one at {v}"
+                );
+            }
+        }
+        // Iterating from anywhere inside the output scale reaches
+        // exactly zero, marching one unit per sample — the band that
+        // used to latch (the apu_demo silence measured −14323 forever).
+        for v in [-32_767, -14_323, -8_282, -1, 1, 8_282, 14_323, 32_767] {
+            let mut state = v;
+            let mut steps = 0u64;
+            while state != 0 {
+                state = dc_pole(state);
+                steps += 1;
+                assert!(steps <= 65_536, "runaway decay from {v}");
+            }
+            assert_eq!(steps, v.unsigned_abs(), "a strict one-unit march from {v}");
+        }
+    }
+
+    #[test]
+    fn dc_blocker_decays_a_negative_step_to_exact_zero() {
+        // The B-10 case itself: the measured apu_demo latch value
+        // (−14323 of ±32767) injected into the filter state under
+        // silence decays to EXACTLY zero and stays there. Under the
+        // old arithmetic-shift pole this state was a fixed point and
+        // the stream held the constant through 2.4 s of trailing
+        // silence (the WAV-tail measurement recorded with B-10).
+        let mut apu = Apu::new(Region::Ntsc);
+        apu.tri.seq_pos = 15; // park the frozen triangle at its zero step
+        apu.dc_x = 0;
+        apu.dc_y = -14_323;
+        let first = apu.mix_sample();
+        assert!(
+            first < -14_000,
+            "the negative step is still audible at first ({first})"
+        );
+        for _ in 0..14_400 {
+            apu.mix_sample();
+        }
+        assert_eq!(apu.dc_y, 0, "the negative state reached exactly zero");
+        assert_eq!(apu.mix_sample(), 0, "and the stream stays at exactly zero");
+    }
+
+    #[test]
+    fn dc_blocker_decays_a_positive_step_to_exact_zero() {
+        // The mirror of the B-10 case: a positive step of the same
+        // magnitude decays to exactly zero as well — both signs decay,
+        // by one unit per sample, with no non-zero fixed point.
+        let mut apu = Apu::new(Region::Ntsc);
+        apu.tri.seq_pos = 15;
+        apu.dc_x = 0;
+        apu.dc_y = 14_323;
+        let first = apu.mix_sample();
+        assert!(
+            first > 14_000,
+            "the positive step is still audible at first ({first})"
+        );
+        for _ in 0..14_400 {
+            apu.mix_sample();
+        }
+        assert_eq!(apu.dc_y, 0, "the positive state reached exactly zero");
+        assert_eq!(apu.mix_sample(), 0, "and the stream stays at exactly zero");
     }
 
     #[test]

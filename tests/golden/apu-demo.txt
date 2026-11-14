@@ -14,11 +14,19 @@
 # NESdev formulas at the NTSC CPU clock (1789772.727 Hz).
 #
 # 2026-11-14 (M4.4, D-41): first deposit - a NEW golden pair, not a
-# migration: no existing fingerprint changed. The silence phases are
-# part of the fingerprint deliberately; their PCM encodes the DC
-# blocker's current settling behavior (the negative-output latch,
-# BLOCKERS.md B-10; any fix is an owner-approved migration of THIS file,
-# the Rust constants and the four concert values together).
+# migration: no existing fingerprint changed. The silence phases were
+# part of the fingerprint deliberately; their PCM encoded the DC
+# blocker's then-current settling behavior (the negative-output latch,
+# BLOCKERS.md B-10).
+# 2026-11-14 (B-10 fix, D-42): OWNER-APPROVED migration of exactly this
+# pair (state + PCM) together with the four concert values: the pole
+# now rounds toward zero, so the trailing silence decays to exactly 0
+# instead of latching on the old -14323 constant. Old -> new:
+#   state 0c197976941b5b27 -> 3d15efeb5b82a7c8
+#   pcm   7548173990dcf41e -> 1082b39f30867115
+# Nothing else moved (hello-600 and brick state/frame/PCM, play values
+# and frame fingerprints all byte-identical; EVIDENCE.md section 7
+# chain). Root cause and proof: DECISIONS.md D-42, BLOCKERS.md B-10.
 frames=1040
-hash=0c197976941b5b27
-pcm=7548173990dcf41e
+hash=3d15efeb5b82a7c8
+pcm=1082b39f30867115
