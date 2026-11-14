@@ -1,0 +1,24 @@
+# SheikhEmu golden: the M4.4 APU demo cartridge (100% self-made).
+# se-cli run tests/roms/apu_demo.nes --frames 1040 --hash
+# The same values are asserted in crates/se-core/tests/apu_demo_golden.rs
+# inside cargo test --workspace on ubuntu, windows and macOS, and that
+# test cross-checks its embedded PRG against this assembled cartridge.
+# Regenerate on purpose after engine changes (DECISIONS.md first):
+#   update the hash=/pcm= lines below AND the GOLDEN_STATE/GOLDEN_PCM
+#   constants in the Rust test in the same commit.
+#
+# The window: the eight 128-frame phases (silence, pulse 1 A4 440.40 Hz,
+# pulse 2 A5 873.91 Hz, triangle A3 220.20 Hz, short-mode noise 300.70 Hz
+# pattern, looped DMC 261.36 Hz, the five-channel ensemble, silence) plus
+# 16 frames of the replayed silence. The frequencies are the published
+# NESdev formulas at the NTSC CPU clock (1789772.727 Hz).
+#
+# 2026-11-14 (M4.4, D-41): first deposit - a NEW golden pair, not a
+# migration: no existing fingerprint changed. The silence phases are
+# part of the fingerprint deliberately; their PCM encodes the DC
+# blocker's current settling behavior (the negative-output latch,
+# BLOCKERS.md B-10; any fix is an owner-approved migration of THIS file,
+# the Rust constants and the four concert values together).
+frames=1040
+hash=0c197976941b5b27
+pcm=7548173990dcf41e
