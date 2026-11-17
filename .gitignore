@@ -5,6 +5,9 @@
 /tests/roms/*.nes
 /tests/roms/build/
 
+# Python bytecode cache
+__pycache__/
+
 # Owner ROMs (category B) - never inside the repository (SPEC 12.2,
 # docs/LEGAL_POLICY.md): run-only material, outside the work tree in
 # ~/SheikhEmuRoms. These entries are the belt-and-suspenders guard;

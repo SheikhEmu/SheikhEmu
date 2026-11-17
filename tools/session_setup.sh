@@ -137,14 +137,20 @@ if command -v cargo >/dev/null 2>&1; then
 else
     fail 'cargo still unavailable after provisioning'
 fi
-command -v cargo-clippy >/dev/null 2>&1 \
-    || rustup component add clippy >/dev/null 2>&1 \
-    || fail 'rustup component add clippy failed'
-command -v cargo-clippy >/dev/null 2>&1 && ok 'component: clippy'
-command -v cargo-fmt >/dev/null 2>&1 \
-    || rustup component add rustfmt >/dev/null 2>&1 \
-    || fail 'rustup component add rustfmt failed'
-command -v cargo-fmt >/dev/null 2>&1 && ok 'component: rustfmt'
+if ! cargo clippy --version >/dev/null 2>&1; then
+    rustup component add clippy >/dev/null 2>&1 \
+        || fail 'rustup component add clippy failed'
+fi
+cargo clippy --version >/dev/null 2>&1 \
+    && ok 'component: clippy' \
+    || fail 'cargo clippy unavailable after provisioning'
+if ! cargo fmt --version >/dev/null 2>&1; then
+    rustup component add rustfmt >/dev/null 2>&1 \
+        || fail 'rustup component add rustfmt failed'
+fi
+cargo fmt --version >/dev/null 2>&1 \
+    && ok 'component: rustfmt' \
+    || fail 'cargo fmt unavailable after provisioning'
 
 # =================================================================
 # 2. ALSA development headers
